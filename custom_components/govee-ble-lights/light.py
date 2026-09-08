@@ -31,7 +31,7 @@ SCAN_INTERVAL = timedelta(seconds=30)
 _LOGGER = logging.getLogger(__name__)
 
 UUID_CONTROL_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b11'
-EFFECT_PARSE = re.compile("\[(\d+)/(\d+)/(\d+)/(\d+)]")
+EFFECT_PARSE = re.compile(r"\[(\d+)/(\d+)/(\d+)/(-?\d+)]")
 SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199']
 
 class LedCommand(IntEnum):
@@ -217,23 +217,49 @@ class GoveeBluetoothLight(LightEntity):
         self._state = None
         self._brightness = None
 
-    @property
-    def effect_list(self) -> list[str] | None:
-        effect_list = []
-        json_data = json.loads(Path(Path(__file__).parent / "jsons" / (self._model + ".json")).read_text())
+    def _load_effects_json(self) -> dict:
+        return json.loads(Path(Path(__file__).parent / "jsons" / (self._model + ".json")).read_text())
+
+    def _iter_effects(self):
+        """Yield (label, categoryIdx, sceneIdx, lightEffectIdx, specialEffectIdx) for every
+        applicable scene. specialEffectIdx == -1 means use the lightEffect's own scenceParam.
+
+        Govee ships each scene either as a base payload on the lightEffect (`scenceParam`)
+        or as per-SKU variants under `specialEffect`. Older code only read `specialEffect`,
+        which for many models is empty or tagged for other SKUs, so most scenes never showed.
+        """
+        json_data = self._load_effects_json()
         for categoryIdx, category in enumerate(json_data['data']['categories']):
             for sceneIdx, scene in enumerate(category['scenes']):
                 for leffectIdx, lightEffect in enumerate(scene['lightEffects']):
-                    for seffectIxd, specialEffect in enumerate(lightEffect['specialEffect']):
-                        # if 'supportSku' not in specialEffect or self._model in specialEffect['supportSku']:
-                        # Workaround cause we need to store some metadata in effect (effect names not unique)
-                        indexes = str(categoryIdx) + "/" + str(sceneIdx) + "/" + str(leffectIdx) + "/" + str(
-                            seffectIxd)
-                        effect_list.append(
-                            category['categoryName'] + " - " + scene['sceneName'] + ' - ' + lightEffect[
-                                'scenceName'] + " [" + indexes + "]")
+                    specials = lightEffect.get('specialEffect') or []
+                    matched = [
+                        idx for idx, se in enumerate(specials)
+                        if se.get('scenceParam') and self._model in se.get('supportSku', [])
+                    ]
+                    if matched:
+                        seffectIdxs = matched
+                    elif lightEffect.get('scenceParam'):
+                        seffectIdxs = [-1]
+                    else:
+                        seffectIdxs = [idx for idx, se in enumerate(specials) if se.get('scenceParam')][:1]
 
-        return effect_list
+                    for seffectIdx in seffectIdxs:
+                        name = lightEffect.get('scenceName') or scene['sceneName']
+                        indexes = f"{categoryIdx}/{sceneIdx}/{leffectIdx}/{seffectIdx}"
+                        label = f"{category['categoryName']} - {scene['sceneName']} - {name} [{indexes}]"
+                        yield label, categoryIdx, sceneIdx, leffectIdx, seffectIdx
+
+    def _resolve_effect_param(self, categoryIdx: int, sceneIdx: int, leffectIdx: int, seffectIdx: int) -> str:
+        lightEffect = self._load_effects_json()['data']['categories'][categoryIdx]['scenes'][sceneIdx]['lightEffects'][
+            leffectIdx]
+        if seffectIdx < 0:
+            return lightEffect['scenceParam']
+        return lightEffect['specialEffect'][seffectIdx]['scenceParam']
+
+    @property
+    def effect_list(self) -> list[str] | None:
+        return [label for label, *_ in self._iter_effects()]
 
     @property
     def name(self) -> str:
@@ -284,17 +310,14 @@ class GoveeBluetoothLight(LightEntity):
                 lightEffectIndex = int(search.group(3))
                 specialEffectIndex = int(search.group(4))
 
-                json_data = json.loads(Path(Path(__file__).parent / "jsons" / (self._model + ".json")).read_text())
-                category = json_data['data']['categories'][categoryIndex]
-                scene = category['scenes'][sceneIndex]
-                lightEffect = scene['lightEffects'][lightEffectIndex]
-                specialEffect = lightEffect['specialEffect'][specialEffectIndex]
+                scene_param = self._resolve_effect_param(categoryIndex, sceneIndex, lightEffectIndex,
+                                                         specialEffectIndex)
 
                 # Prepare packets to send big payload in separated chunks
                 for command in prepareMultiplePacketsData(0xa3,
                                                           array.array('B', [0x02]),
                                                           array.array('B',
-                                                                      base64.b64decode(specialEffect['scenceParam'])
+                                                                      base64.b64decode(scene_param)
                                                                       )):
                     commands.append(command)
 
