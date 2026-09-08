@@ -29,6 +29,17 @@ class GoveeAPI:
         })
         return response.json()['payload']['capabilities'][0]['parameters']['options']
 
+    async def list_diy_scenes(self, sku: str, device: str):
+        url = f"{self.base_url}/device/diy-scenes"
+        response = await asyncio.to_thread(requests.post, url, headers=self.headers, json={
+            'requestId': uuid.uuid4().hex,
+            'payload': {
+                'sku': sku,
+                'device': device,
+            }
+        })
+        return response.json()['payload']['capabilities'][0]['parameters']['options']
+
     async def toggle_power(self, sku: str, device: str, value: int):
         url = f"{self.base_url}/device/control"
         response = await asyncio.to_thread(requests.post, url, headers=self.headers, json={
@@ -104,7 +115,7 @@ class GoveeAPI:
         })
         return response.json()
 
-    async def set_scene(self, sku: str, device: str, value: object):
+    async def set_scene(self, sku: str, device: str, value: object, instance: str = 'lightScene'):
         url = f"{self.base_url}/device/control"
         response = await asyncio.to_thread(requests.post, url, headers=self.headers, json={
             'requestId': uuid.uuid4().hex,
@@ -113,8 +124,46 @@ class GoveeAPI:
                 'device': device,
                 'capability': {
                     'type': 'devices.capabilities.dynamic_scene',
-                    'instance': 'lightScene',
+                    'instance': instance,
                     'value': value
+                }
+            }
+        })
+        return response.json()
+
+    async def set_segment_rgb(self, sku: str, device: str, segments: list, r: int, g: int, b: int):
+        url = f"{self.base_url}/device/control"
+        response = await asyncio.to_thread(requests.post, url, headers=self.headers, json={
+            'requestId': uuid.uuid4().hex,
+            'payload': {
+                'sku': sku,
+                'device': device,
+                'capability': {
+                    'type': 'devices.capabilities.segment_color_setting',
+                    'instance': 'segmentedColorRgb',
+                    'value': {
+                        'segment': segments,
+                        'rgb': ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | ((b & 0xFF) << 0)
+                    }
+                }
+            }
+        })
+        return response.json()
+
+    async def set_segment_brightness(self, sku: str, device: str, segments: list, value: int):
+        url = f"{self.base_url}/device/control"
+        response = await asyncio.to_thread(requests.post, url, headers=self.headers, json={
+            'requestId': uuid.uuid4().hex,
+            'payload': {
+                'sku': sku,
+                'device': device,
+                'capability': {
+                    'type': 'devices.capabilities.segment_color_setting',
+                    'instance': 'segmentedBrightness',
+                    'value': {
+                        'segment': segments,
+                        'brightness': value
+                    }
                 }
             }
         })

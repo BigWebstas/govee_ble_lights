@@ -53,6 +53,24 @@ class LedMode(IntEnum):
     SEGMENTS = 0x15
 
 
+def _find_capability(capabilities: list, cap_type: str, instance: str) -> dict | None:
+    for cap in capabilities:
+        if cap.get('type') == cap_type and cap.get('instance') == instance:
+            return cap
+    return None
+
+
+def _segment_count(capability: dict, default: int = 15) -> int:
+    """Read the number of controllable segments from a segment_color_setting capability."""
+    try:
+        for field in capability['parameters']['fields']:
+            if field.get('fieldName') == 'segment':
+                return int(field['size']['max'])
+    except (KeyError, TypeError, ValueError):
+        pass
+    return default
+
+
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities):
     if config_entry.entry_id in hass.data[DOMAIN]:
         hub: Hub = hass.data[DOMAIN][config_entry.entry_id]
@@ -64,7 +82,15 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
         for device in devices:
             if device['type'] == 'devices.types.light':
                 _LOGGER.info("Adding device: %s", device)
-                async_add_entities([GoveeAPILight(hub, device)])
+                entities = [GoveeAPILight(hub, device)]
+                segment_cap = _find_capability(device.get("capabilities", []),
+                                               'devices.capabilities.segment_color_setting',
+                                               'segmentedColorRgb')
+                if segment_cap is not None:
+                    count = _segment_count(segment_cap)
+                    _LOGGER.info("Adding %d segments for device: %s", count, device["device"])
+                    entities += [GoveeAPISegmentLight(hub, device, index) for index in range(count)]
+                async_add_entities(entities)
     elif hub.address is not None:
         ble_device = bluetooth.async_ble_device_from_address(hass, hub.address.upper(), False)
         async_add_entities([GoveeBluetoothLight(hub, ble_device, config_entry)])
@@ -89,6 +115,7 @@ class GoveeAPILight(LightEntity, dict):
         self._attr_name = device["deviceName"]
 
         color_modes: set[ColorMode] = set()
+        self._has_diy_scenes = False
 
         for cap in device["capabilities"]:
             if cap['instance'] == 'powerSwitch':
@@ -107,6 +134,11 @@ class GoveeAPILight(LightEntity, dict):
                 self._attr_supported_features = LightEntityFeature(
                     LightEntityFeature.EFFECT | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION
                 )
+            if cap['instance'] == 'diyScene':
+                self._has_diy_scenes = True
+                self._attr_supported_features = LightEntityFeature(
+                    LightEntityFeature.EFFECT | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION
+                )
 
         if ColorMode.ONOFF in color_modes:
             self._attr_supported_color_modes = {ColorMode.ONOFF}
@@ -119,7 +151,19 @@ class GoveeAPILight(LightEntity, dict):
 
         self._state = None
         self._brightness = None
-        self.update_scenes()
+
+    @property
+    def device_info(self) -> dict:
+        return {
+            "identifiers": {(DOMAIN, self.device)},
+            "name": self.device_data["deviceName"],
+            "manufacturer": "Govee",
+            "model": self.sku,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        await self.update_scenes()
 
     async def async_update(self):
         """Retrieve latest state."""
@@ -141,16 +185,31 @@ class GoveeAPILight(LightEntity, dict):
                 self._attr_rgb_color = ((num >> 16) & 0xFF, (num >> 8) & 0xFF, num & 0xFF)
 
     async def update_scenes(self):
-        if LightEntityFeature.EFFECT in self.supported_features:
-            if self._attr_effect_list is None or len(self._attr_effect_list) == 0:
-                _LOGGER.info("Updating device effects: %s", self.device_data)
+        if LightEntityFeature.EFFECT not in self.supported_features:
+            return
+        if self._attr_effect_list:
+            return
 
-                store = Store(self.hass, 1, f"{DOMAIN}/effect_list_{self.sku}.json")
-                scenes = await self.hub.api.list_scenes(self.sku, self.device)
+        _LOGGER.info("Updating device effects: %s", self.device_data)
+        scenes = []
 
-                await store.async_save(scenes)
+        try:
+            scenes += await self.hub.api.list_scenes(self.sku, self.device)
+        except Exception:
+            _LOGGER.exception("Failed to load light scenes for %s", self.sku)
 
-                self._attr_effect_list = [scene['name'] for scene in scenes]
+        if self._has_diy_scenes:
+            try:
+                for scene in await self.hub.api.list_diy_scenes(self.sku, self.device):
+                    scenes.append({**scene, 'name': f"DIY: {scene['name']}"})
+            except Exception:
+                _LOGGER.exception("Failed to load DIY scenes for %s", self.sku)
+
+        store = Store(self.hass, 1, f"{DOMAIN}/effect_list_{self.sku}.json")
+        await store.async_save(scenes)
+
+        self._attr_effect_list = [scene['name'] for scene in scenes]
+        self.async_write_ha_state()
 
     @property
     def name(self) -> str:
@@ -193,13 +252,84 @@ class GoveeAPILight(LightEntity, dict):
             )
             scene = next(scenes)
             _LOGGER.info("Set scene: %s", scene)
-            await self.hub.api.set_scene(self.sku, self.device, scene['value'])
+            instance = 'diyScene' if isinstance(scene['value'], int) else 'lightScene'
+            await self.hub.api.set_scene(self.sku, self.device, scene['value'], instance)
 
         await self.hub.api.toggle_power(self.sku, self.device, 1)
 
     async def async_turn_off(self, **kwargs) -> None:
         await self.hub.api.toggle_power(self.sku, self.device, 0)
         self._state = False
+
+
+class GoveeAPISegmentLight(LightEntity):
+    """One controllable segment of a Govee light, driven through the cloud API.
+
+    The Govee API exposes no per-segment power or state read-back, so on/off is
+    emulated with segmented brightness and the state here is optimistic.
+    """
+
+    _attr_color_mode = ColorMode.RGB
+    _attr_supported_color_modes = {ColorMode.RGB}
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+
+    def __init__(self, hub: Hub, device: dict, index: int) -> None:
+        self.hub = hub
+        self.device_data = device
+        self.sku = device["sku"]
+        self.device = device["device"]
+        self._index = index
+
+        self._attr_name = f"Segment {index + 1}"
+        self._attr_unique_id = f"{self.device}_segment_{index}"
+
+        self._state = None
+        self._brightness = 255
+        self._attr_rgb_color = (255, 255, 255)
+
+    @property
+    def device_info(self) -> dict:
+        return {
+            "identifiers": {(DOMAIN, self.device)},
+            "name": self.device_data["deviceName"],
+            "manufacturer": "Govee",
+            "model": self.sku,
+        }
+
+    @property
+    def is_on(self) -> bool | None:
+        return self._state
+
+    @property
+    def brightness(self):
+        return self._brightness
+
+    async def async_turn_on(self, **kwargs) -> None:
+        segments = [self._index]
+
+        if ATTR_RGB_COLOR in kwargs:
+            red, green, blue = kwargs[ATTR_RGB_COLOR]
+            await self.hub.api.set_segment_rgb(self.sku, self.device, segments, red, green, blue)
+            self._attr_rgb_color = (red, green, blue)
+
+        if ATTR_BRIGHTNESS in kwargs:
+            brightness = kwargs[ATTR_BRIGHTNESS]
+            await self.hub.api.set_segment_brightness(self.sku, self.device, segments,
+                                                      round(brightness / 255 * 100))
+            self._brightness = brightness
+        elif ATTR_RGB_COLOR not in kwargs:
+            # Plain toggle on: re-assert the last colour so the segment lights up.
+            red, green, blue = self._attr_rgb_color
+            await self.hub.api.set_segment_rgb(self.sku, self.device, segments, red, green, blue)
+
+        self._state = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self.hub.api.set_segment_brightness(self.sku, self.device, [self._index], 0)
+        self._state = False
+        self.async_write_ha_state()
 
 
 class GoveeBluetoothLight(LightEntity):
