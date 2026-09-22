@@ -215,14 +215,15 @@ class GoveeAPILight(CoordinatorEntity, LightEntity):
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
+        await self.coordinator.async_request_refresh()
         await self.update_scenes()
 
     @property
     def available(self) -> bool:
-        return super().available and self.coordinator.data.get(self.device) is not None
+        return super().available and (self.coordinator.data or {}).get(self.device) is not None
 
     def _handle_coordinator_update(self) -> None:
-        state = self.coordinator.data.get(self.device)
+        state = (self.coordinator.data or {}).get(self.device)
         if state is not None:
             for cap in state["capabilities"]:
                 if cap['instance'] == 'powerSwitch':
@@ -401,7 +402,10 @@ class GoveeLANLight(LightEntity):
 
     @property
     def available(self) -> bool:
-        return self._device.is_connected
+        # getattr guard: is_connected was added in govee-local-api 3.0.0; an
+        # older cached install (unpinned before this integration required
+        # >=3.0.0) would otherwise crash every state update.
+        return getattr(self._device, "is_connected", True)
 
     @property
     def is_on(self) -> bool | None:
@@ -696,8 +700,10 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity, GoveeBLEControlMixin):
     @property
     def available(self) -> bool:
         if self._lan_device is not None:
-            return self._lan_device.is_connected
-        return super().available and self.coordinator.data.get(self.device) is not None
+            # getattr guard: is_connected was added in govee-local-api 3.0.0;
+            # an older cached install would otherwise crash every update.
+            return getattr(self._lan_device, "is_connected", True)
+        return super().available and (self.coordinator.data or {}).get(self.device) is not None
 
     @property
     def brightness(self):
@@ -730,6 +736,8 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity, GoveeBLEControlMixin):
         if self._lan_device is not None:
             self._lan_device.set_update_callback(lambda device: self.async_write_ha_state())
             await self._update_cloud_scenes()
+        else:
+            await self.coordinator.async_request_refresh()
 
     async def async_will_remove_from_hass(self) -> None:
         if self._lan_device is not None:
@@ -749,7 +757,7 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity, GoveeBLEControlMixin):
     def _handle_coordinator_update(self) -> None:
         """Absorb cloud-polled state (used when not LAN-backed; BLE has no status read-back)."""
         if self._lan_device is None:
-            state = self.coordinator.data.get(self.device)
+            state = (self.coordinator.data or {}).get(self.device)
             if state is not None:
                 for cap in state["capabilities"]:
                     if cap['instance'] == 'powerSwitch':
