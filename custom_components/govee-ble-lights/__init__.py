@@ -60,7 +60,19 @@ async def internal_cache_setup(
         devices = await store.async_load()
         if devices:
             _LOGGER.debug(f"{len(devices)} devices loaded from cache!")
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = Hub(api, devices=devices)
+
+    # Broadcast-discover LAN devices so API devices that are also LAN-reachable
+    # can be upgraded to hybrid control in light.py, alongside BLE matching.
+    lan_controller = GoveeController(
+        loop=hass.loop,
+        discovery_enabled=True,
+        evict_enabled=True,
+        update_enabled=True,
+    )
+    await lan_controller.start()
+    await asyncio.sleep(5)
+
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = Hub(api, devices=devices, lan_controller=lan_controller)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
 

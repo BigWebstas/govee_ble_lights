@@ -72,6 +72,34 @@ def _segment_count(capability: dict, default: int = 15) -> int:
     return default
 
 
+async def _load_cloud_scenes(hass: HomeAssistant, hub: Hub, sku: str, device: str, has_diy_scenes: bool) -> list[dict]:
+    """Fetch the cloud scene/DIY-scene catalog for a device and cache it for later lookup."""
+    scenes = []
+
+    try:
+        scenes += await hub.api.list_scenes(sku, device)
+    except Exception:
+        _LOGGER.exception("Failed to load light scenes for %s", sku)
+
+    if has_diy_scenes:
+        try:
+            for scene in await hub.api.list_diy_scenes(sku, device):
+                scenes.append({**scene, 'name': f"DIY: {scene['name']}"})
+        except Exception:
+            _LOGGER.exception("Failed to load DIY scenes for %s", sku)
+
+    store = Store(hass, 1, f"{DOMAIN}/effect_list_{sku}.json")
+    await store.async_save(scenes)
+    return scenes
+
+
+async def _resolve_cloud_scene(hass: HomeAssistant, sku: str, effect_name: str) -> dict:
+    """Look up a previously cached cloud scene by its display name."""
+    store = Store(hass, 1, f"{DOMAIN}/effect_list_{sku}.json")
+    scenes = await store.async_load()
+    return next(scene for scene in scenes if scene['name'] == effect_name)
+
+
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities):
     if config_entry.entry_id in hass.data[DOMAIN]:
         hub: Hub = hass.data[DOMAIN][config_entry.entry_id]
@@ -85,13 +113,25 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                 _LOGGER.info("Adding device: %s", device)
 
                 light_entity = GoveeAPILight(hub, device)
+
+                ble_device = None
                 candidate_mac = derive_ble_mac(device["device"])
                 if candidate_mac is not None and has_local_ble_support(device["sku"]):
                     ble_device = bluetooth.async_ble_device_from_address(hass, candidate_mac.upper(), False)
                     if ble_device is not None:
-                        _LOGGER.info("Cloud device %s matched BLE MAC %s: using hybrid control",
-                                     device["device"], candidate_mac)
-                        light_entity = GoveeHybridLight(hub, device, ble_device)
+                        _LOGGER.info("Cloud device %s matched BLE MAC %s", device["device"], candidate_mac)
+
+                lan_device = None
+                if hub.lan_controller is not None:
+                    lan_device = next(
+                        (d for d in hub.lan_controller.devices if d.fingerprint == device["device"]), None
+                    )
+                    if lan_device is not None:
+                        _LOGGER.info("Cloud device %s matched LAN device at %s",
+                                     device["device"], lan_device.ip)
+
+                if ble_device is not None or lan_device is not None:
+                    light_entity = GoveeHybridLight(hub, device, ble_device=ble_device, lan_device=lan_device)
 
                 entities = [light_entity]
                 segment_cap = _find_capability(device.get("capabilities", []),
@@ -204,23 +244,7 @@ class GoveeAPILight(LightEntity, dict):
             return
 
         _LOGGER.info("Updating device effects: %s", self.device_data)
-        scenes = []
-
-        try:
-            scenes += await self.hub.api.list_scenes(self.sku, self.device)
-        except Exception:
-            _LOGGER.exception("Failed to load light scenes for %s", self.sku)
-
-        if self._has_diy_scenes:
-            try:
-                for scene in await self.hub.api.list_diy_scenes(self.sku, self.device):
-                    scenes.append({**scene, 'name': f"DIY: {scene['name']}"})
-            except Exception:
-                _LOGGER.exception("Failed to load DIY scenes for %s", self.sku)
-
-        store = Store(self.hass, 1, f"{DOMAIN}/effect_list_{self.sku}.json")
-        await store.async_save(scenes)
-
+        scenes = await _load_cloud_scenes(self.hass, self.hub, self.sku, self.device, self._has_diy_scenes)
         self._attr_effect_list = [scene['name'] for scene in scenes]
         self.async_write_ha_state()
 
@@ -258,12 +282,7 @@ class GoveeAPILight(LightEntity, dict):
 
         if ATTR_EFFECT in kwargs:
             effect_name = kwargs.get(ATTR_EFFECT)
-            store = Store(self.hass, 1, f"{DOMAIN}/effect_list_{self.sku}.json")
-            scenes = (
-                scene for scene in await store.async_load()
-                if scene['name'] == effect_name
-            )
-            scene = next(scenes)
+            scene = await _resolve_cloud_scene(self.hass, self.sku, effect_name)
             _LOGGER.info("Set scene: %s", scene)
             instance = 'diyScene' if isinstance(scene['value'], int) else 'lightScene'
             await self.hub.api.set_scene(self.sku, self.device, scene['value'], instance)
@@ -457,8 +476,7 @@ class GoveeBLEControlMixin:
             return lightEffect['scenceParam']
         return lightEffect['specialEffect'][seffectIdx]['scenceParam']
 
-    @property
-    def effect_list(self) -> list[str] | None:
+    def _local_ble_effect_list(self) -> list[str]:
         return [label for label, *_ in self._iter_effects()]
 
     def _build_ble_on_commands(self, **kwargs) -> list[bytes]:
@@ -585,6 +603,10 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
         """Return true if light is on."""
         return self._state
 
+    @property
+    def effect_list(self) -> list[str] | None:
+        return self._local_ble_effect_list()
+
     async def async_turn_on(self, **kwargs) -> None:
         self._state = True
 
@@ -599,21 +621,24 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
 
 
 class GoveeHybridLight(LightEntity, GoveeBLEControlMixin):
-    """A cloud-API device that's also visible over BLE.
+    """A cloud-API device that's also visible over LAN and/or BLE.
 
-    Commands are sent over BLE for speed. State is still read back through
-    the cloud API, since this codebase's BLE protocol has no status
-    read-back. If a BLE write fails (device out of range, connection
-    error), power/brightness/color fall back to the cloud API so the light
-    still responds; a failed effect write is not retried over the cloud,
-    since cloud scene values and local BLE effect payloads are different,
-    incompatible encodings.
+    Commands are tried LAN first, then BLE, then the cloud API, in that
+    order, falling through on any error so the light still responds. State
+    for a LAN-backed device is pushed live by the LAN controller; a
+    BLE-only device has no local status read-back in this codebase, so its
+    state is polled from the cloud instead.
+
+    Effects: a LAN-matched device uses the cloud's scene catalog (so a
+    failed LAN `set_scene` can fall back to the cloud's own `set_scene`
+    call with the same value) — a BLE-only device keeps using the local BLE
+    effect catalog, which has no cloud equivalent to fall back to.
     """
 
     _attr_color_mode = ColorMode.RGB
     _attr_supported_color_modes = {ColorMode.RGB}
 
-    def __init__(self, hub: Hub, device: dict, ble_device) -> None:
+    def __init__(self, hub: Hub, device: dict, ble_device=None, lan_device=None) -> None:
         self.hub = hub
         self.device_data = device
         self.sku = device["sku"]
@@ -621,10 +646,24 @@ class GoveeHybridLight(LightEntity, GoveeBLEControlMixin):
         self._model = self.sku
         self._is_segmented = self._model in SEGMENTED_MODELS
         self._ble_device = ble_device
+        self._lan_device = lan_device
 
         self._attr_name = device["deviceName"]
+        self._attr_effect_list = None
+        self._has_diy_scenes = False
+
+        supports_effect = ble_device is not None
+        if lan_device is not None:
+            for cap in device["capabilities"]:
+                if cap['instance'] == 'lightScene':
+                    supports_effect = True
+                if cap['instance'] == 'diyScene':
+                    supports_effect = True
+                    self._has_diy_scenes = True
+
         self._attr_supported_features = LightEntityFeature(
-            LightEntityFeature.EFFECT | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION
+            (LightEntityFeature.EFFECT if supports_effect else LightEntityFeature(0))
+            | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION
         )
 
         self._state = None
@@ -648,15 +687,68 @@ class GoveeHybridLight(LightEntity, GoveeBLEControlMixin):
         return self.device
 
     @property
+    def should_poll(self) -> bool:
+        # LAN state arrives via push callback; BLE-only/cloud state needs polling.
+        return self._lan_device is None
+
+    @property
+    def available(self) -> bool:
+        if self._lan_device is not None:
+            return self._lan_device.is_connected
+        return True
+
+    @property
     def brightness(self):
+        if self._lan_device is not None:
+            return round(self._lan_device.brightness / 100 * 255)
         return self._brightness
 
     @property
     def is_on(self) -> bool | None:
+        if self._lan_device is not None:
+            return self._lan_device.on
         return self._state
 
+    @property
+    def rgb_color(self):
+        if self._lan_device is not None:
+            return self._lan_device.rgb_color
+        return self._attr_rgb_color
+
+    @property
+    def effect_list(self) -> list[str] | None:
+        if self._lan_device is not None:
+            return self._attr_effect_list
+        if self._ble_device is not None:
+            return self._local_ble_effect_list()
+        return None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._lan_device is not None:
+            self._lan_device.set_update_callback(lambda device: self.async_write_ha_state())
+            await self._update_cloud_scenes()
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._lan_device is not None:
+            self._lan_device.set_update_callback(None)
+        await super().async_will_remove_from_hass()
+
+    async def _update_cloud_scenes(self) -> None:
+        if LightEntityFeature.EFFECT not in self.supported_features:
+            return
+        if self._attr_effect_list:
+            return
+
+        scenes = await _load_cloud_scenes(self.hass, self.hub, self.sku, self.device, self._has_diy_scenes)
+        self._attr_effect_list = [scene['name'] for scene in scenes]
+        self.async_write_ha_state()
+
     async def async_update(self):
-        """Retrieve latest state from the cloud (BLE has no status read-back)."""
+        """Retrieve latest state from the cloud (used when not LAN-backed; BLE has no status read-back)."""
+        if self._lan_device is not None:
+            return
+
         state = await self.hub.api.get_device_state(self.sku, self.device)
         for cap in state["capabilities"]:
             if cap['instance'] == 'powerSwitch':
@@ -673,15 +765,48 @@ class GoveeHybridLight(LightEntity, GoveeBLEControlMixin):
         if ATTR_BRIGHTNESS in kwargs:
             self._brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
 
-        try:
-            await self._write_ble_commands(self._build_ble_on_commands(**kwargs))
-            return
-        except Exception:
-            if ATTR_EFFECT in kwargs:
-                _LOGGER.warning("BLE effect failed for %s; not retried over the cloud API",
-                                self.device, exc_info=True)
+        if ATTR_EFFECT in kwargs and self._lan_device is not None:
+            effect_name = kwargs[ATTR_EFFECT]
+            try:
+                scene = await _resolve_cloud_scene(self.hass, self.sku, effect_name)
+                await self._lan_device.set_scene(str(scene['value']))
                 return
-            _LOGGER.warning("BLE control failed for %s, falling back to cloud API", self.device, exc_info=True)
+            except Exception:
+                _LOGGER.warning("LAN effect failed for %s, falling back to cloud API",
+                                self.device, exc_info=True)
+                try:
+                    scene = await _resolve_cloud_scene(self.hass, self.sku, effect_name)
+                    instance = 'diyScene' if isinstance(scene['value'], int) else 'lightScene'
+                    await self.hub.api.set_scene(self.sku, self.device, scene['value'], instance)
+                except Exception:
+                    _LOGGER.exception("Cloud fallback for effect also failed for %s", self.device)
+                return
+
+        if self._lan_device is not None and ATTR_EFFECT not in kwargs:
+            try:
+                if ATTR_RGB_COLOR in kwargs:
+                    red, green, blue = kwargs[ATTR_RGB_COLOR]
+                    await self._lan_device.set_rgb_color(red, green, blue)
+                if ATTR_BRIGHTNESS in kwargs:
+                    await self._lan_device.set_brightness(round(self._brightness / 255 * 100))
+                await self._lan_device.turn_on()
+                return
+            except Exception:
+                _LOGGER.warning("LAN control failed for %s, falling back", self.device, exc_info=True)
+
+        if self._ble_device is not None:
+            try:
+                await self._write_ble_commands(self._build_ble_on_commands(**kwargs))
+                return
+            except Exception:
+                if ATTR_EFFECT in kwargs:
+                    _LOGGER.warning("BLE effect failed for %s; not retried over the cloud API",
+                                    self.device, exc_info=True)
+                    return
+                _LOGGER.warning("BLE control failed for %s, falling back to cloud API", self.device, exc_info=True)
+        elif ATTR_EFFECT in kwargs:
+            _LOGGER.warning("No BLE match for %s; can't apply effect locally or via cloud", self.device)
+            return
 
         if ATTR_BRIGHTNESS in kwargs:
             await self.hub.api.set_brightness(self.sku, self.device, (self._brightness / 255) * 100)
@@ -693,12 +818,21 @@ class GoveeHybridLight(LightEntity, GoveeBLEControlMixin):
         await self.hub.api.toggle_power(self.sku, self.device, 1)
 
     async def async_turn_off(self, **kwargs) -> None:
-        try:
-            await self._write_ble_commands([self._build_ble_off_command()])
-            self._state = False
-            return
-        except Exception:
-            _LOGGER.warning("BLE control failed for %s, falling back to cloud API", self.device, exc_info=True)
+        if self._lan_device is not None:
+            try:
+                await self._lan_device.turn_off()
+                self._state = False
+                return
+            except Exception:
+                _LOGGER.warning("LAN control failed for %s, falling back", self.device, exc_info=True)
+
+        if self._ble_device is not None:
+            try:
+                await self._write_ble_commands([self._build_ble_off_command()])
+                self._state = False
+                return
+            except Exception:
+                _LOGGER.warning("BLE control failed for %s, falling back to cloud API", self.device, exc_info=True)
 
         await self.hub.api.toggle_power(self.sku, self.device, 0)
         self._state = False
