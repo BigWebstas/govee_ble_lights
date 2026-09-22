@@ -16,18 +16,16 @@ from homeassistant.components.light import (ATTR_BRIGHTNESS, ATTR_RGB_COLOR, ATT
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 import homeassistant.util.color as color_util
 
 from .const import DOMAIN
 from pathlib import Path
 import json
+from .coordinator import SCAN_INTERVAL
 from .govee_utils import prepareMultiplePacketsData, derive_ble_mac, has_local_ble_support
 import base64
 from . import Hub
-from datetime import timedelta
-
-SCAN_INTERVAL = timedelta(seconds=30)
-
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -149,12 +147,13 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
         async_add_entities([GoveeLANLight(device) for device in hub.lan_controller.devices])
 
 
-class GoveeAPILight(LightEntity, dict):
+class GoveeAPILight(CoordinatorEntity, LightEntity):
     _attr_color_mode = ColorMode.RGB
+    _attr_should_poll = False
 
     def __init__(self, hub: Hub, device: dict) -> None:
         """Initialize an API light."""
-        super().__init__()
+        super().__init__(hub.coordinator, context=device["device"])
 
         self.hub = hub
 
@@ -218,24 +217,27 @@ class GoveeAPILight(LightEntity, dict):
         await super().async_added_to_hass()
         await self.update_scenes()
 
-    async def async_update(self):
-        """Retrieve latest state."""
-        _LOGGER.info("Updating device: %s", self.device_data)
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.data.get(self.device) is not None
 
-        state = await self.hub.api.get_device_state(self.sku, self.device)
-        for cap in state["capabilities"]:
-            if cap['instance'] == 'powerSwitch':
-                self._state = cap['state']['value'] == 1
-            if cap['instance'] == 'brightness':
-                self._brightness = cap['state']['value']
-            if cap['instance'] == 'colorTemperatureK':
-                value = cap['state']['value']
-                if value != 0:
-                    self._attr_color_temp_kelvin = value
-                    self._attr_color_temp = color_util.color_temperature_kelvin_to_mired(value)
-            if cap['instance'] == 'colorRgb':
-                num = cap['state']['value']
-                self._attr_rgb_color = ((num >> 16) & 0xFF, (num >> 8) & 0xFF, num & 0xFF)
+    def _handle_coordinator_update(self) -> None:
+        state = self.coordinator.data.get(self.device)
+        if state is not None:
+            for cap in state["capabilities"]:
+                if cap['instance'] == 'powerSwitch':
+                    self._state = cap['state']['value'] == 1
+                if cap['instance'] == 'brightness':
+                    self._brightness = cap['state']['value']
+                if cap['instance'] == 'colorTemperatureK':
+                    value = cap['state']['value']
+                    if value != 0:
+                        self._attr_color_temp_kelvin = value
+                        self._attr_color_temp = color_util.color_temperature_kelvin_to_mired(value)
+                if cap['instance'] == 'colorRgb':
+                    num = cap['state']['value']
+                    self._attr_rgb_color = ((num >> 16) & 0xFF, (num >> 8) & 0xFF, num & 0xFF)
+        super()._handle_coordinator_update()
 
     async def update_scenes(self):
         if LightEntityFeature.EFFECT not in self.supported_features:
@@ -523,17 +525,19 @@ class GoveeBLEControlMixin:
         return self._prepareSinglePacketData(LedCommand.POWER, [0x0])
 
     async def _write_ble_commands(self, commands: list[bytes]) -> None:
+        client = await self._connectBluetooth()
         for command in commands:
-            client = await self._connectBluetooth()
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
 
     async def _connectBluetooth(self) -> BleakClient:
-        for i in range(3):
+        last_error: Exception | None = None
+        for _ in range(3):
             try:
-                client = await bleak_retry_connector.establish_connection(BleakClient, self._ble_device, self.unique_id)
-                return client
-            except:
+                return await bleak_retry_connector.establish_connection(BleakClient, self._ble_device, self.unique_id)
+            except Exception as ex:
+                last_error = ex
                 continue
+        raise ConnectionError(f"Could not connect to {self.unique_id} after 3 attempts") from last_error
 
     def _prepareSinglePacketData(self, cmd, payload):
         if not isinstance(cmd, int):
@@ -620,7 +624,7 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
         self._state = False
 
 
-class GoveeHybridLight(LightEntity, GoveeBLEControlMixin):
+class GoveeHybridLight(CoordinatorEntity, LightEntity, GoveeBLEControlMixin):
     """A cloud-API device that's also visible over LAN and/or BLE.
 
     Commands are tried LAN first, then BLE, then the cloud API, in that
@@ -637,8 +641,11 @@ class GoveeHybridLight(LightEntity, GoveeBLEControlMixin):
 
     _attr_color_mode = ColorMode.RGB
     _attr_supported_color_modes = {ColorMode.RGB}
+    _attr_should_poll = False
 
     def __init__(self, hub: Hub, device: dict, ble_device=None, lan_device=None) -> None:
+        super().__init__(hub.coordinator, context=device["device"] if lan_device is None else None)
+
         self.hub = hub
         self.device_data = device
         self.sku = device["sku"]
@@ -687,15 +694,10 @@ class GoveeHybridLight(LightEntity, GoveeBLEControlMixin):
         return self.device
 
     @property
-    def should_poll(self) -> bool:
-        # LAN state arrives via push callback; BLE-only/cloud state needs polling.
-        return self._lan_device is None
-
-    @property
     def available(self) -> bool:
         if self._lan_device is not None:
             return self._lan_device.is_connected
-        return True
+        return super().available and self.coordinator.data.get(self.device) is not None
 
     @property
     def brightness(self):
@@ -744,20 +746,20 @@ class GoveeHybridLight(LightEntity, GoveeBLEControlMixin):
         self._attr_effect_list = [scene['name'] for scene in scenes]
         self.async_write_ha_state()
 
-    async def async_update(self):
-        """Retrieve latest state from the cloud (used when not LAN-backed; BLE has no status read-back)."""
-        if self._lan_device is not None:
-            return
-
-        state = await self.hub.api.get_device_state(self.sku, self.device)
-        for cap in state["capabilities"]:
-            if cap['instance'] == 'powerSwitch':
-                self._state = cap['state']['value'] == 1
-            if cap['instance'] == 'brightness':
-                self._brightness = cap['state']['value']
-            if cap['instance'] == 'colorRgb':
-                num = cap['state']['value']
-                self._attr_rgb_color = ((num >> 16) & 0xFF, (num >> 8) & 0xFF, num & 0xFF)
+    def _handle_coordinator_update(self) -> None:
+        """Absorb cloud-polled state (used when not LAN-backed; BLE has no status read-back)."""
+        if self._lan_device is None:
+            state = self.coordinator.data.get(self.device)
+            if state is not None:
+                for cap in state["capabilities"]:
+                    if cap['instance'] == 'powerSwitch':
+                        self._state = cap['state']['value'] == 1
+                    if cap['instance'] == 'brightness':
+                        self._brightness = cap['state']['value']
+                    if cap['instance'] == 'colorRgb':
+                        num = cap['state']['value']
+                        self._attr_rgb_color = ((num >> 16) & 0xFF, (num >> 8) & 0xFF, num & 0xFF)
+        super()._handle_coordinator_update()
 
     async def async_turn_on(self, **kwargs) -> None:
         self._state = True
