@@ -1,4 +1,27 @@
 import array
+from pathlib import Path
+
+
+def derive_ble_mac(device_id: str) -> str | None:
+    """Best-effort mapping from a cloud API device id to a BLE MAC.
+
+    Govee's OpenAPI `device` id is an 8-group hex id; based on Govee's own
+    API examples (unverified, no official documentation) the last 6 groups
+    are the real BLE MAC and the first 2 are an extra prefix. Already-6-group
+    ids are passed through as-is.
+    """
+    groups = device_id.split(":")
+    if len(groups) == 6:
+        return device_id
+    if len(groups) == 8:
+        return ":".join(groups[-6:])
+    return None
+
+
+def has_local_ble_support(sku: str) -> bool:
+    """Whether this SKU has a local BLE effect catalog bundled with the integration."""
+    return (Path(__file__).parent / "jsons" / f"{sku}.json").exists()
+
 
 def prepareMultiplePacketsData(protocol_type, header_array, data):
     result = []

@@ -21,7 +21,7 @@ import homeassistant.util.color as color_util
 from .const import DOMAIN
 from pathlib import Path
 import json
-from .govee_utils import prepareMultiplePacketsData
+from .govee_utils import prepareMultiplePacketsData, derive_ble_mac, has_local_ble_support
 import base64
 from . import Hub
 from datetime import timedelta
@@ -83,7 +83,17 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
         for device in devices:
             if device['type'] == 'devices.types.light':
                 _LOGGER.info("Adding device: %s", device)
-                entities = [GoveeAPILight(hub, device)]
+
+                light_entity = GoveeAPILight(hub, device)
+                candidate_mac = derive_ble_mac(device["device"])
+                if candidate_mac is not None and has_local_ble_support(device["sku"]):
+                    ble_device = bluetooth.async_ble_device_from_address(hass, candidate_mac.upper(), False)
+                    if ble_device is not None:
+                        _LOGGER.info("Cloud device %s matched BLE MAC %s: using hybrid control",
+                                     device["device"], candidate_mac)
+                        light_entity = GoveeHybridLight(hub, device, ble_device)
+
+                entities = [light_entity]
                 segment_cap = _find_capability(device.get("capabilities", []),
                                                'devices.capabilities.segment_color_setting',
                                                'segmentedColorRgb')
@@ -399,29 +409,13 @@ class GoveeLANLight(LightEntity):
         await self._device.turn_off()
 
 
-class GoveeBluetoothLight(LightEntity):
-    _attr_color_mode = ColorMode.RGB
-    _attr_supported_color_modes = {ColorMode.RGB}
-    _attr_supported_features = LightEntityFeature(
-        LightEntityFeature.EFFECT | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION)
+class GoveeBLEControlMixin:
+    """Shared BLE packet-building and local effect-catalog logic.
 
-    def __init__(self, hub: Hub, ble_device, config_entry: ConfigEntry) -> None:
-        """Initialize an bluetooth light."""
-        self._mac = hub.address
-        self._model = config_entry.data["model"]
-        self._is_segmented = self._model in SEGMENTED_MODELS
-        self._ble_device = ble_device
-        self._state = None
-        self._brightness = None
-
-    @property
-    def device_info(self) -> dict:
-        return {
-            "identifiers": {(DOMAIN, self._mac.replace(":", ""))},
-            "name": "GOVEE Light",
-            "manufacturer": "Govee",
-            "model": self._model,
-        }
+    Expects the including class to set `self._model`, `self._is_segmented`
+    and `self._ble_device`, and to implement a `unique_id` property (used as
+    the connection cache key).
+    """
 
     def _load_effects_json(self) -> dict:
         return json.loads(Path(Path(__file__).parent / "jsons" / (self._model + ".json")).read_text())
@@ -467,34 +461,12 @@ class GoveeBluetoothLight(LightEntity):
     def effect_list(self) -> list[str] | None:
         return [label for label, *_ in self._iter_effects()]
 
-    @property
-    def name(self) -> str:
-        """Return the name of the switch."""
-        return "GOVEE Light"
-
-    @property
-    def unique_id(self) -> str:
-        """Return a unique, Home Assistant friendly identifier for this entity."""
-        return self._mac.replace(":", "")
-
-    @property
-    def brightness(self):
-        return self._brightness
-
-    @property
-    def is_on(self) -> bool | None:
-        """Return true if light is on."""
-        return self._state
-
-    async def async_turn_on(self, **kwargs) -> None:
+    def _build_ble_on_commands(self, **kwargs) -> list[bytes]:
         commands = [self._prepareSinglePacketData(LedCommand.POWER, [0x1])]
-
-        self._state = True
 
         if ATTR_BRIGHTNESS in kwargs:
             brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
             commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
-            self._brightness = brightness
 
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
@@ -527,15 +499,15 @@ class GoveeBluetoothLight(LightEntity):
                                                                       )):
                     commands.append(command)
 
+        return commands
+
+    def _build_ble_off_command(self) -> bytes:
+        return self._prepareSinglePacketData(LedCommand.POWER, [0x0])
+
+    async def _write_ble_commands(self, commands: list[bytes]) -> None:
         for command in commands:
             client = await self._connectBluetooth()
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
-
-    async def async_turn_off(self, **kwargs) -> None:
-        client = await self._connectBluetooth()
-        await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC,
-                                     self._prepareSinglePacketData(LedCommand.POWER, [0x0]), False)
-        self._state = False
 
     async def _connectBluetooth(self) -> BleakClient:
         for i in range(3):
@@ -568,3 +540,165 @@ class GoveeBluetoothLight(LightEntity):
 
         frame += bytes([checksum & 0xFF])
         return frame
+
+
+class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
+    _attr_color_mode = ColorMode.RGB
+    _attr_supported_color_modes = {ColorMode.RGB}
+    _attr_supported_features = LightEntityFeature(
+        LightEntityFeature.EFFECT | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION)
+
+    def __init__(self, hub: Hub, ble_device, config_entry: ConfigEntry) -> None:
+        """Initialize an bluetooth light."""
+        self._mac = hub.address
+        self._model = config_entry.data["model"]
+        self._is_segmented = self._model in SEGMENTED_MODELS
+        self._ble_device = ble_device
+        self._state = None
+        self._brightness = None
+
+    @property
+    def device_info(self) -> dict:
+        return {
+            "identifiers": {(DOMAIN, self._mac.replace(":", ""))},
+            "name": "GOVEE Light",
+            "manufacturer": "Govee",
+            "model": self._model,
+        }
+
+    @property
+    def name(self) -> str:
+        """Return the name of the switch."""
+        return "GOVEE Light"
+
+    @property
+    def unique_id(self) -> str:
+        """Return a unique, Home Assistant friendly identifier for this entity."""
+        return self._mac.replace(":", "")
+
+    @property
+    def brightness(self):
+        return self._brightness
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return true if light is on."""
+        return self._state
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self._state = True
+
+        if ATTR_BRIGHTNESS in kwargs:
+            self._brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
+
+        await self._write_ble_commands(self._build_ble_on_commands(**kwargs))
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._write_ble_commands([self._build_ble_off_command()])
+        self._state = False
+
+
+class GoveeHybridLight(LightEntity, GoveeBLEControlMixin):
+    """A cloud-API device that's also visible over BLE.
+
+    Commands are sent over BLE for speed. State is still read back through
+    the cloud API, since this codebase's BLE protocol has no status
+    read-back. If a BLE write fails (device out of range, connection
+    error), power/brightness/color fall back to the cloud API so the light
+    still responds; a failed effect write is not retried over the cloud,
+    since cloud scene values and local BLE effect payloads are different,
+    incompatible encodings.
+    """
+
+    _attr_color_mode = ColorMode.RGB
+    _attr_supported_color_modes = {ColorMode.RGB}
+
+    def __init__(self, hub: Hub, device: dict, ble_device) -> None:
+        self.hub = hub
+        self.device_data = device
+        self.sku = device["sku"]
+        self.device = device["device"]
+        self._model = self.sku
+        self._is_segmented = self._model in SEGMENTED_MODELS
+        self._ble_device = ble_device
+
+        self._attr_name = device["deviceName"]
+        self._attr_supported_features = LightEntityFeature(
+            LightEntityFeature.EFFECT | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION
+        )
+
+        self._state = None
+        self._brightness = None
+
+    @property
+    def device_info(self) -> dict:
+        return {
+            "identifiers": {(DOMAIN, self.device)},
+            "name": self.device_data["deviceName"],
+            "manufacturer": "Govee",
+            "model": self.sku,
+        }
+
+    @property
+    def name(self) -> str:
+        return self._attr_name
+
+    @property
+    def unique_id(self) -> str:
+        return self.device
+
+    @property
+    def brightness(self):
+        return self._brightness
+
+    @property
+    def is_on(self) -> bool | None:
+        return self._state
+
+    async def async_update(self):
+        """Retrieve latest state from the cloud (BLE has no status read-back)."""
+        state = await self.hub.api.get_device_state(self.sku, self.device)
+        for cap in state["capabilities"]:
+            if cap['instance'] == 'powerSwitch':
+                self._state = cap['state']['value'] == 1
+            if cap['instance'] == 'brightness':
+                self._brightness = cap['state']['value']
+            if cap['instance'] == 'colorRgb':
+                num = cap['state']['value']
+                self._attr_rgb_color = ((num >> 16) & 0xFF, (num >> 8) & 0xFF, num & 0xFF)
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self._state = True
+
+        if ATTR_BRIGHTNESS in kwargs:
+            self._brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
+
+        try:
+            await self._write_ble_commands(self._build_ble_on_commands(**kwargs))
+            return
+        except Exception:
+            if ATTR_EFFECT in kwargs:
+                _LOGGER.warning("BLE effect failed for %s; not retried over the cloud API",
+                                self.device, exc_info=True)
+                return
+            _LOGGER.warning("BLE control failed for %s, falling back to cloud API", self.device, exc_info=True)
+
+        if ATTR_BRIGHTNESS in kwargs:
+            await self.hub.api.set_brightness(self.sku, self.device, (self._brightness / 255) * 100)
+
+        if ATTR_RGB_COLOR in kwargs:
+            red, green, blue = kwargs.get(ATTR_RGB_COLOR)
+            await self.hub.api.set_color_rgb(self.sku, self.device, red, green, blue)
+
+        await self.hub.api.toggle_power(self.sku, self.device, 1)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        try:
+            await self._write_ble_commands([self._build_ble_off_command()])
+            self._state = False
+            return
+        except Exception:
+            _LOGGER.warning("BLE control failed for %s, falling back to cloud API", self.device, exc_info=True)
+
+        await self.hub.api.toggle_power(self.sku, self.device, 0)
+        self._state = False

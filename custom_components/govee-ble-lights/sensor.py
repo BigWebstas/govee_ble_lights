@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from homeassistant.components import bluetooth
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -9,12 +10,14 @@ from homeassistant.helpers.entity import EntityCategory
 
 from . import Hub
 from .const import DOMAIN
+from .govee_utils import derive_ble_mac, has_local_ble_support
 
 _LOGGER = logging.getLogger(__name__)
 
 CONNECTION_CLOUD_API = "Cloud API"
 CONNECTION_BLUETOOTH = "Bluetooth (Local)"
 CONNECTION_LAN = "LAN (Local)"
+CONNECTION_HYBRID = "Hybrid (BLE + Cloud)"
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities):
@@ -24,11 +27,20 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
         return
 
     if hub.devices is not None:
-        entities = [
-            GoveeConnectionTypeSensor(device, CONNECTION_CLOUD_API)
-            for device in hub.devices
-            if device["type"] == "devices.types.light"
-        ]
+        entities = []
+        for device in hub.devices:
+            if device["type"] != "devices.types.light":
+                continue
+
+            connection_type = CONNECTION_CLOUD_API
+            ble_mac = None
+            candidate_mac = derive_ble_mac(device["device"])
+            if candidate_mac is not None and has_local_ble_support(device["sku"]):
+                if bluetooth.async_ble_device_from_address(hass, candidate_mac.upper(), False) is not None:
+                    connection_type = CONNECTION_HYBRID
+                    ble_mac = candidate_mac
+
+            entities.append(GoveeConnectionTypeSensor(device, connection_type, ble_mac=ble_mac))
         async_add_entities(entities)
     elif hub.address is not None:
         model = config_entry.data.get("model")
@@ -49,9 +61,10 @@ class GoveeConnectionTypeSensor(SensorEntity):
     _attr_icon = "mdi:api"
 
     def __init__(self, device: dict | None, connection_type: str, address: str = None, model: str = None,
-                 lan_device=None) -> None:
+                 lan_device=None, ble_mac: str = None) -> None:
         self._attr_native_value = connection_type
         self._ip_address = None
+        self._ble_mac = ble_mac
 
         if device is not None:
             self._device_id = device["device"]
@@ -71,9 +84,11 @@ class GoveeConnectionTypeSensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict | None:
-        if self._ip_address is None:
-            return None
-        return {"ip_address": self._ip_address}
+        if self._ip_address is not None:
+            return {"ip_address": self._ip_address}
+        if self._ble_mac is not None:
+            return {"ble_mac": self._ble_mac}
+        return None
 
     @property
     def device_info(self) -> dict:
