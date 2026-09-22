@@ -14,6 +14,7 @@ _LOGGER = logging.getLogger(__name__)
 
 CONNECTION_CLOUD_API = "Cloud API"
 CONNECTION_BLUETOOTH = "Bluetooth (Local)"
+CONNECTION_LAN = "LAN (Local)"
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities):
@@ -34,6 +35,11 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
         async_add_entities([
             GoveeConnectionTypeSensor(None, CONNECTION_BLUETOOTH, address=hub.address, model=model)
         ])
+    elif hub.lan_controller is not None:
+        async_add_entities([
+            GoveeConnectionTypeSensor(None, CONNECTION_LAN, lan_device=device)
+            for device in hub.lan_controller.devices
+        ])
 
 
 class GoveeConnectionTypeSensor(SensorEntity):
@@ -42,19 +48,32 @@ class GoveeConnectionTypeSensor(SensorEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_icon = "mdi:api"
 
-    def __init__(self, device: dict | None, connection_type: str, address: str = None, model: str = None) -> None:
+    def __init__(self, device: dict | None, connection_type: str, address: str = None, model: str = None,
+                 lan_device=None) -> None:
         self._attr_native_value = connection_type
+        self._ip_address = None
 
         if device is not None:
             self._device_id = device["device"]
             self._device_name = device["deviceName"]
             self._model = device["sku"]
+        elif lan_device is not None:
+            self._device_id = lan_device.fingerprint
+            self._device_name = "GOVEE Light"
+            self._model = lan_device.sku
+            self._ip_address = lan_device.ip
         else:
             self._device_id = address.replace(":", "")
             self._device_name = "GOVEE Light"
             self._model = model
 
         self._attr_unique_id = f"{self._device_id}_connection_type"
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        if self._ip_address is None:
+            return None
+        return {"ip_address": self._ip_address}
 
     @property
     def device_info(self) -> dict:

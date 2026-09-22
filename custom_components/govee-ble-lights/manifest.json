@@ -11,7 +11,7 @@
         }
     ],
     "codeowners": ["@Beshelmek"],
-    "requirements": ["bleak-retry-connector"],
+    "requirements": ["bleak-retry-connector", "govee-local-api"],
     "dependencies": ["network"],
     "issue_tracker": "https://github.com/Beshelmek/govee_ble_lights/issues",
     "documentation": "https://github.com/Beshelmek/govee_ble_lights",

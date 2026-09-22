@@ -8,6 +8,7 @@ from enum import IntEnum
 import bleak_retry_connector
 
 from bleak import BleakClient
+from govee_local_api import GoveeDevice
 from homeassistant.components import bluetooth
 from homeassistant.components.light import (ATTR_BRIGHTNESS, ATTR_RGB_COLOR, ATTR_EFFECT, ColorMode, LightEntity,
                                             LightEntityFeature, ATTR_COLOR_TEMP_KELVIN)
@@ -94,6 +95,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
     elif hub.address is not None:
         ble_device = bluetooth.async_ble_device_from_address(hass, hub.address.upper(), False)
         async_add_entities([GoveeBluetoothLight(hub, ble_device, config_entry)])
+    elif hub.lan_controller is not None:
+        async_add_entities([GoveeLANLight(device) for device in hub.lan_controller.devices])
 
 
 class GoveeAPILight(LightEntity, dict):
@@ -330,6 +333,70 @@ class GoveeAPISegmentLight(LightEntity):
         await self.hub.api.set_segment_brightness(self.sku, self.device, [self._index], 0)
         self._state = False
         self.async_write_ha_state()
+
+
+class GoveeLANLight(LightEntity):
+    """A Govee light controlled over the local network (LAN UDP API).
+
+    State is pushed by the govee-local-api controller's own status-poll and
+    discovery loop, so this entity doesn't poll on its own.
+    """
+
+    _attr_color_mode = ColorMode.RGB
+    _attr_supported_color_modes = {ColorMode.RGB}
+    _attr_should_poll = False
+
+    def __init__(self, device: GoveeDevice) -> None:
+        self._device = device
+        self._attr_name = "GOVEE Light"
+        self._attr_unique_id = device.fingerprint
+
+    @property
+    def device_info(self) -> dict:
+        return {
+            "identifiers": {(DOMAIN, self._device.fingerprint)},
+            "name": "GOVEE Light",
+            "manufacturer": "Govee",
+            "model": self._device.sku,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._device.set_update_callback(lambda device: self.async_write_ha_state())
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._device.set_update_callback(None)
+        await super().async_will_remove_from_hass()
+
+    @property
+    def available(self) -> bool:
+        return self._device.is_connected
+
+    @property
+    def is_on(self) -> bool | None:
+        return self._device.on
+
+    @property
+    def brightness(self):
+        return round(self._device.brightness / 100 * 255)
+
+    @property
+    def rgb_color(self):
+        return self._device.rgb_color
+
+    async def async_turn_on(self, **kwargs) -> None:
+        if ATTR_RGB_COLOR in kwargs:
+            red, green, blue = kwargs[ATTR_RGB_COLOR]
+            await self._device.set_rgb_color(red, green, blue)
+
+        if ATTR_BRIGHTNESS in kwargs:
+            brightness = kwargs[ATTR_BRIGHTNESS]
+            await self._device.set_brightness(round(brightness / 255 * 100))
+
+        await self._device.turn_on()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._device.turn_off()
 
 
 class GoveeBluetoothLight(LightEntity):

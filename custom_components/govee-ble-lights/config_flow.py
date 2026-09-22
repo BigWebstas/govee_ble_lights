@@ -13,8 +13,11 @@ from homeassistant.config_entries import ConfigFlow
 from homeassistant.const import (CONF_ADDRESS, CONF_MODEL, CONF_API_KEY, CONF_TYPE)
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import DOMAIN, CONF_TYPE_API, CONF_TYPE_BLE
+from govee_local_api import GoveeController
+
+from .const import DOMAIN, CONF_TYPE_API, CONF_TYPE_BLE, CONF_TYPE_LAN, CONF_FINGERPRINT
 from pathlib import Path
+import asyncio
 
 class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
@@ -31,7 +34,9 @@ class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._available_config_types: dict[str, str] = {
             CONF_TYPE_API: 'API',
             CONF_TYPE_BLE: 'BLE',
+            CONF_TYPE_LAN: 'LAN',
         }
+        self._discovered_lan_devices: dict[str, tuple[str, str]] = {}
 
         jsons_path = Path(Path(__file__).parent / "jsons")
         for file in jsons_path.iterdir():
@@ -129,6 +134,56 @@ class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors
         )
 
+    async def async_step_lan(
+            self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        errors = {}
+
+        if not self._discovered_lan_devices:
+            def _discovered(device, is_new: bool) -> bool:
+                self._discovered_lan_devices[device.fingerprint] = (device.ip, device.sku)
+                return True
+
+            controller = GoveeController(discovery_enabled=True, discovered_callback=_discovered)
+            await controller.start()
+            for _ in range(10):
+                if self._discovered_lan_devices:
+                    break
+                await asyncio.sleep(0.5)
+            cleanup_done = controller.cleanup()
+            await cleanup_done.wait()
+
+        current_ids = self._async_current_ids()
+        available = {
+            fingerprint: f"{sku} ({ip})"
+            for fingerprint, (ip, sku) in self._discovered_lan_devices.items()
+            if fingerprint not in current_ids
+        }
+
+        if not available:
+            errors["base"] = "no_devices_found"
+
+        if user_input is not None and CONF_ADDRESS in user_input and user_input[CONF_ADDRESS] is not None:
+            fingerprint = user_input[CONF_ADDRESS]
+            ip, sku = self._discovered_lan_devices[fingerprint]
+            await self.async_set_unique_id(fingerprint, raise_on_progress=False)
+            self._abort_if_unique_id_configured()
+            return self.async_create_entry(
+                title=f"{sku} ({ip})", data={
+                    CONF_ADDRESS: ip,
+                    CONF_MODEL: sku,
+                    CONF_FINGERPRINT: fingerprint,
+                }
+            )
+
+        return self.async_show_form(
+            step_id="lan",
+            data_schema=vol.Schema({
+                vol.Required(CONF_ADDRESS): vol.In(available),
+            }),
+            errors=errors
+        )
+
     async def async_step_user(
             self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
@@ -136,6 +191,8 @@ class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
             return await self.async_step_api(user_input)
         if user_input is not None and user_input[CONF_TYPE] == CONF_TYPE_BLE:
             return await self.async_step_ble(user_input)
+        if user_input is not None and user_input[CONF_TYPE] == CONF_TYPE_LAN:
+            return await self.async_step_lan(user_input)
 
         return self.async_show_form(
             step_id="user",
