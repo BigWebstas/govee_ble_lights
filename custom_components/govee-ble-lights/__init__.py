@@ -16,7 +16,7 @@ import logging
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[str] = ["light"]
+PLATFORMS: list[str] = ["light", "sensor"]
 
 
 class Hub:

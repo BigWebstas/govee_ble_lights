@@ -347,6 +347,15 @@ class GoveeBluetoothLight(LightEntity):
         self._state = None
         self._brightness = None
 
+    @property
+    def device_info(self) -> dict:
+        return {
+            "identifiers": {(DOMAIN, self._mac.replace(":", ""))},
+            "name": "GOVEE Light",
+            "manufacturer": "Govee",
+            "model": self._model,
+        }
+
     def _load_effects_json(self) -> dict:
         return json.loads(Path(Path(__file__).parent / "jsons" / (self._model + ".json")).read_text())
 
