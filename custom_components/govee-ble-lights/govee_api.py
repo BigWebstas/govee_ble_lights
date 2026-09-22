@@ -42,7 +42,7 @@ class GoveeAPI:
                 'device': device,
             }
         })
-        return data['payload']['capabilities'][0]['parameters']['options']
+        return self._scene_options(data)
 
     async def list_diy_scenes(self, sku: str, device: str):
         data = await self._request('POST', '/device/diy-scenes', {
@@ -52,7 +52,21 @@ class GoveeAPI:
                 'device': device,
             }
         })
-        return data['payload']['capabilities'][0]['parameters']['options']
+        return self._scene_options(data)
+
+    @staticmethod
+    def _scene_options(data: dict) -> list:
+        """Pull the scene option list out of a scenes/diy-scenes response.
+
+        A device with no scenes configured for that catalog (common for DIY
+        scenes) omits `capabilities` or its `parameters`/`options` entirely,
+        rather than returning an empty options list - treat that as "no
+        scenes" instead of an error.
+        """
+        capabilities = data.get('payload', {}).get('capabilities') or []
+        if not capabilities:
+            return []
+        return capabilities[0].get('parameters', {}).get('options', [])
 
     async def toggle_power(self, sku: str, device: str, value: int):
         return await self._control(sku, device, {
