@@ -24,6 +24,7 @@ import json
 from .coordinator import SCAN_INTERVAL
 from .govee_utils import prepareMultiplePacketsData
 import base64
+import homeassistant.util.dt as dt_util
 from . import Hub
 
 _LOGGER = logging.getLogger(__name__)
@@ -663,6 +664,8 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity):
         self.sku = device["sku"]
         self.device = device["device"]
         self._lan_device = lan_device
+        self._last_lan_check = dt_util.utcnow()
+        self._cloud_listener_unsub = None
 
         self._attr_name = device["deviceName"]
         self._attr_effect_list = None
@@ -772,7 +775,46 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity):
                         self._attr_rgb_color = ((num >> 16) & 0xFF, (num >> 8) & 0xFF, num & 0xFF)
         super()._handle_coordinator_update()
 
+    def _refresh_lan_device(self) -> None:
+        """Re-resolve the matched LAN device by fingerprint, throttled to SCAN_INTERVAL.
+
+        `hub.lan_controller.devices` can evict and re-add a device (e.g. after an
+        IP change or a dropout), replacing the object this entity matched at
+        startup. Without this, a stale `_lan_device` would keep failing forever
+        even once the device is reachable again under a fresh object.
+        """
+        if self.hub.lan_controller is None:
+            return
+        now = dt_util.utcnow()
+        if now - self._last_lan_check < SCAN_INTERVAL:
+            return
+        self._last_lan_check = now
+        self._lan_device = next(
+            (d for d in self.hub.lan_controller.devices if d.fingerprint == self.device), None
+        )
+        if self._lan_device is None:
+            self._ensure_cloud_polling()
+
+    def _ensure_cloud_polling(self) -> None:
+        """Register for cloud-state polling once the LAN match is lost.
+
+        This entity is set up with no coordinator context (it's normally
+        LAN-pushed), so the shared coordinator never fetches its cloud state.
+        If `_refresh_lan_device` demotes it to cloud-only, nothing would ever
+        populate `is_on`/`brightness`/`rgb_color` or clear `available` without
+        this - it would look permanently unavailable even though the cloud
+        fallback in `async_turn_on`/`async_turn_off` still works.
+        """
+        if self._cloud_listener_unsub is not None:
+            return
+        self._cloud_listener_unsub = self.coordinator.async_add_listener(
+            self._handle_coordinator_update, self.device
+        )
+        self.async_on_remove(self._cloud_listener_unsub)
+        self.hass.async_create_task(self.coordinator.async_request_refresh())
+
     async def async_turn_on(self, **kwargs) -> None:
+        self._refresh_lan_device()
         self._state = True
 
         if ATTR_BRIGHTNESS in kwargs:
@@ -821,6 +863,7 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity):
         await self.hub.api.toggle_power(self.sku, self.device, 1)
 
     async def async_turn_off(self, **kwargs) -> None:
+        self._refresh_lan_device()
         if self._lan_device is not None:
             try:
                 await self._lan_device.turn_off()
