@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import array
 import logging
-import re
 
 from enum import IntEnum
 import bleak_retry_connector
@@ -23,14 +22,13 @@ from .const import DOMAIN
 from pathlib import Path
 import json
 from .coordinator import SCAN_INTERVAL
-from .govee_utils import prepareMultiplePacketsData, derive_ble_mac, has_local_ble_support
+from .govee_utils import prepareMultiplePacketsData
 import base64
 from . import Hub
 
 _LOGGER = logging.getLogger(__name__)
 
 UUID_CONTROL_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b11'
-EFFECT_PARSE = re.compile(r"\[(\d+)/(\d+)/(\d+)/(-?\d+)]")
 SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199', 'H70B1', 'H6095', 'H7092', 'H619D']
 
 class LedCommand(IntEnum):
@@ -112,13 +110,6 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
 
                 light_entity = GoveeAPILight(hub, device)
 
-                ble_device = None
-                candidate_mac = derive_ble_mac(device["device"])
-                if candidate_mac is not None and has_local_ble_support(device["sku"]):
-                    ble_device = bluetooth.async_ble_device_from_address(hass, candidate_mac.upper(), False)
-                    if ble_device is not None:
-                        _LOGGER.info("Cloud device %s matched BLE MAC %s", device["device"], candidate_mac)
-
                 lan_device = None
                 if hub.lan_controller is not None:
                     lan_device = next(
@@ -128,8 +119,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                         _LOGGER.info("Cloud device %s matched LAN device at %s",
                                      device["device"], lan_device.ip)
 
-                if ble_device is not None or lan_device is not None:
-                    light_entity = GoveeHybridLight(hub, device, ble_device=ble_device, lan_device=lan_device)
+                if lan_device is not None:
+                    light_entity = GoveeHybridLight(hub, device, lan_device=lan_device)
 
                 entities = [light_entity]
                 segment_cap = _find_capability(device.get("capabilities", []),
@@ -446,8 +437,9 @@ class GoveeBLEControlMixin:
         return json.loads(Path(Path(__file__).parent / "jsons" / (self._model + ".json")).read_text())
 
     def _iter_effects(self):
-        """Yield (label, categoryIdx, sceneIdx, lightEffectIdx, specialEffectIdx) for every
-        applicable scene. specialEffectIdx == -1 means use the lightEffect's own scenceParam.
+        """Yield (name, categoryName, categoryIdx, sceneIdx, lightEffectIdx, specialEffectIdx)
+        for every applicable scene. specialEffectIdx == -1 means use the lightEffect's own
+        scenceParam.
 
         Govee ships each scene either as a base payload on the lightEffect (`scenceParam`)
         or as per-SKU variants under `specialEffect`. Older code only read `specialEffect`,
@@ -471,9 +463,34 @@ class GoveeBLEControlMixin:
 
                     for seffectIdx in seffectIdxs:
                         name = lightEffect.get('scenceName') or scene['sceneName']
-                        indexes = f"{categoryIdx}/{sceneIdx}/{leffectIdx}/{seffectIdx}"
-                        label = f"{category['categoryName']} - {scene['sceneName']} - {name} [{indexes}]"
-                        yield label, categoryIdx, sceneIdx, leffectIdx, seffectIdx
+                        yield name, category['categoryName'], categoryIdx, sceneIdx, leffectIdx, seffectIdx
+
+    def _effect_map(self) -> dict[str, tuple[int, int, int, int]]:
+        """Map each displayed effect name to its (categoryIdx, sceneIdx, lightEffectIdx,
+        specialEffectIdx).
+
+        Displayed names match the plain scene names cloud-API devices show (e.g. "Fall")
+        instead of the raw category/index-suffixed form, since BLE devices have no cloud
+        catalog to resolve a selection by cloud scene id - the name itself has to double as
+        the lookup key. Govee reuses scene names across (and even within) categories, so a
+        name is disambiguated with its category in parentheses when it collides with
+        another, and with a counter on top of that for same-name-same-category scenes.
+        """
+        entries = list(self._iter_effects())
+        counts: dict[str, int] = {}
+        for name, *_ in entries:
+            counts[name] = counts.get(name, 0) + 1
+
+        mapping: dict[str, tuple[int, int, int, int]] = {}
+        for name, category_name, categoryIdx, sceneIdx, leffectIdx, seffectIdx in entries:
+            label = f"{name} ({category_name})" if counts[name] > 1 else name
+            if label in mapping:
+                suffix = 2
+                while f"{label} #{suffix}" in mapping:
+                    suffix += 1
+                label = f"{label} #{suffix}"
+            mapping[label] = (categoryIdx, sceneIdx, leffectIdx, seffectIdx)
+        return mapping
 
     def _resolve_effect_param(self, categoryIdx: int, sceneIdx: int, leffectIdx: int, seffectIdx: int) -> str:
         lightEffect = self._load_effects_json()['data']['categories'][categoryIdx]['scenes'][sceneIdx]['lightEffects'][
@@ -483,7 +500,7 @@ class GoveeBLEControlMixin:
         return lightEffect['specialEffect'][seffectIdx]['scenceParam']
 
     def _local_ble_effect_list(self) -> list[str]:
-        return [label for label, *_ in self._iter_effects()]
+        return list(self._effect_map().keys())
 
     def _build_ble_on_commands(self, **kwargs) -> list[bytes]:
         commands = [self._prepareSinglePacketData(LedCommand.POWER, [0x1])]
@@ -504,13 +521,7 @@ class GoveeBLEControlMixin:
         if ATTR_EFFECT in kwargs:
             effect = kwargs.get(ATTR_EFFECT)
             if len(effect) > 0:
-                search = EFFECT_PARSE.search(effect)
-
-                # Parse effect indexes
-                categoryIndex = int(search.group(1))
-                sceneIndex = int(search.group(2))
-                lightEffectIndex = int(search.group(3))
-                specialEffectIndex = int(search.group(4))
+                categoryIndex, sceneIndex, lightEffectIndex, specialEffectIndex = self._effect_map()[effect]
 
                 scene_param = self._resolve_effect_param(categoryIndex, sceneIndex, lightEffectIndex,
                                                          specialEffectIndex)
@@ -628,42 +639,36 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
         self._state = False
 
 
-class GoveeHybridLight(CoordinatorEntity, LightEntity, GoveeBLEControlMixin):
-    """A cloud-API device that's also visible over LAN and/or BLE.
+class GoveeHybridLight(CoordinatorEntity, LightEntity):
+    """A cloud-API device that's also visible over LAN.
 
-    Commands are tried LAN first, then BLE, then the cloud API, in that
-    order, falling through on any error so the light still responds. State
-    for a LAN-backed device is pushed live by the LAN controller; a
-    BLE-only device has no local status read-back in this codebase, so its
-    state is polled from the cloud instead.
+    Commands are tried LAN first, falling through to the cloud API on any
+    error so the light still responds. State for a LAN-backed device is
+    pushed live by the LAN controller.
 
-    Effects: a LAN-matched device uses the cloud's scene catalog (so a
+    Effects: a LAN-matched device uses the cloud's scene catalog, so a
     failed LAN `set_scene` can fall back to the cloud's own `set_scene`
-    call with the same value) — a BLE-only device keeps using the local BLE
-    effect catalog, which has no cloud equivalent to fall back to.
+    call with the same value.
     """
 
     _attr_color_mode = ColorMode.RGB
     _attr_supported_color_modes = {ColorMode.RGB}
     _attr_should_poll = False
 
-    def __init__(self, hub: Hub, device: dict, ble_device=None, lan_device=None) -> None:
+    def __init__(self, hub: Hub, device: dict, lan_device=None) -> None:
         super().__init__(hub.coordinator, context=device["device"] if lan_device is None else None)
 
         self.hub = hub
         self.device_data = device
         self.sku = device["sku"]
         self.device = device["device"]
-        self._model = self.sku
-        self._is_segmented = self._model in SEGMENTED_MODELS
-        self._ble_device = ble_device
         self._lan_device = lan_device
 
         self._attr_name = device["deviceName"]
         self._attr_effect_list = None
         self._has_diy_scenes = False
 
-        supports_effect = ble_device is not None
+        supports_effect = False
         if lan_device is not None:
             for cap in device["capabilities"]:
                 if cap['instance'] == 'lightScene':
@@ -727,8 +732,6 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity, GoveeBLEControlMixin):
     def effect_list(self) -> list[str] | None:
         if self._lan_device is not None:
             return self._attr_effect_list
-        if self._ble_device is not None:
-            return self._local_ble_effect_list()
         return None
 
     async def async_added_to_hass(self) -> None:
@@ -804,18 +807,8 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity, GoveeBLEControlMixin):
             except Exception:
                 _LOGGER.warning("LAN control failed for %s, falling back", self.device, exc_info=True)
 
-        if self._ble_device is not None:
-            try:
-                await self._write_ble_commands(self._build_ble_on_commands(**kwargs))
-                return
-            except Exception:
-                if ATTR_EFFECT in kwargs:
-                    _LOGGER.warning("BLE effect failed for %s; not retried over the cloud API",
-                                    self.device, exc_info=True)
-                    return
-                _LOGGER.warning("BLE control failed for %s, falling back to cloud API", self.device, exc_info=True)
-        elif ATTR_EFFECT in kwargs:
-            _LOGGER.warning("No BLE match for %s; can't apply effect locally or via cloud", self.device)
+        if ATTR_EFFECT in kwargs and self._lan_device is None:
+            _LOGGER.warning("No LAN match for %s; can't apply effect locally or via cloud", self.device)
             return
 
         if ATTR_BRIGHTNESS in kwargs:
@@ -835,14 +828,6 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity, GoveeBLEControlMixin):
                 return
             except Exception:
                 _LOGGER.warning("LAN control failed for %s, falling back", self.device, exc_info=True)
-
-        if self._ble_device is not None:
-            try:
-                await self._write_ble_commands([self._build_ble_off_command()])
-                self._state = False
-                return
-            except Exception:
-                _LOGGER.warning("BLE control failed for %s, falling back to cloud API", self.device, exc_info=True)
 
         await self.hub.api.toggle_power(self.sku, self.device, 0)
         self._state = False
