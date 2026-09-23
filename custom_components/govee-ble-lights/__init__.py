@@ -105,9 +105,19 @@ async def internal_cache_setup(
             _LOGGER.debug(f"{len(devices)} devices loaded from cache!")
 
     # Broadcast-discover LAN devices so API devices that are also LAN-reachable
-    # can be upgraded to hybrid control in light.py.
+    # can be upgraded to hybrid control in light.py. Poll instead of a single
+    # fixed wait, since LAN discovery replies trickle in over several seconds.
     lan_controller = await _get_shared_lan_controller(hass)
-    await asyncio.sleep(5)
+    light_device_ids = {
+        device["device"]
+        for device in (devices or [])
+        if device.get("type") == "devices.types.light"
+    }
+    for _ in range(20):
+        discovered_ids = {d.fingerprint for d in lan_controller.devices}
+        if light_device_ids and light_device_ids <= discovered_ids:
+            break
+        await asyncio.sleep(5)
 
     sku_by_device = {
         device["device"]: device["sku"]
