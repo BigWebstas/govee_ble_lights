@@ -647,9 +647,8 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity):
     error so the light still responds. State for a LAN-backed device is
     pushed live by the LAN controller.
 
-    Effects: a LAN-matched device uses the cloud's scene catalog, so a
-    failed LAN `set_scene` can fall back to the cloud's own `set_scene`
-    call with the same value.
+    Effects always go through the cloud API: the scene catalog is the
+    cloud's, and the LAN protocol has no way to address those scenes.
     """
 
     _attr_color_mode = ColorMode.RGB
@@ -730,12 +729,6 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity):
         if self._lan_device is not None:
             return self._lan_device.rgb_color
         return self._attr_rgb_color
-
-    @property
-    def effect_list(self) -> list[str] | None:
-        if self._lan_device is not None:
-            return self._attr_effect_list
-        return None
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -820,24 +813,16 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity):
         if ATTR_BRIGHTNESS in kwargs:
             self._brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
 
-        if ATTR_EFFECT in kwargs and self._lan_device is not None:
-            effect_name = kwargs[ATTR_EFFECT]
-            try:
-                scene = await _resolve_cloud_scene(self.hass, self.sku, effect_name)
-                await self._lan_device.set_scene(str(scene['value']))
-                return
-            except Exception:
-                _LOGGER.warning("LAN effect failed for %s, falling back to cloud API",
-                                self.device, exc_info=True)
-                try:
-                    scene = await _resolve_cloud_scene(self.hass, self.sku, effect_name)
-                    instance = 'diyScene' if isinstance(scene['value'], int) else 'lightScene'
-                    await self.hub.api.set_scene(self.sku, self.device, scene['value'], instance)
-                except Exception:
-                    _LOGGER.exception("Cloud fallback for effect also failed for %s", self.device)
-                return
+        if ATTR_EFFECT in kwargs:
+            # Always via cloud: govee_local_api's set_scene only knows a small
+            # built-in table keyed by generic names ("sunrise", "movie", ...),
+            # not cloud scene ids, and silently no-ops on a miss.
+            scene = await _resolve_cloud_scene(self.hass, self.sku, kwargs[ATTR_EFFECT])
+            instance = 'diyScene' if isinstance(scene['value'], int) else 'lightScene'
+            await self.hub.api.set_scene(self.sku, self.device, scene['value'], instance)
+            return
 
-        if self._lan_device is not None and ATTR_EFFECT not in kwargs:
+        if self._lan_device is not None:
             try:
                 if ATTR_RGB_COLOR in kwargs:
                     red, green, blue = kwargs[ATTR_RGB_COLOR]
@@ -848,10 +833,6 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity):
                 return
             except Exception:
                 _LOGGER.warning("LAN control failed for %s, falling back", self.device, exc_info=True)
-
-        if ATTR_EFFECT in kwargs and self._lan_device is None:
-            _LOGGER.warning("No LAN match for %s; can't apply effect locally or via cloud", self.device)
-            return
 
         if ATTR_BRIGHTNESS in kwargs:
             await self.hub.api.set_brightness(self.sku, self.device, (self._brightness / 255) * 100)
