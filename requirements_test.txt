@@ -1,0 +1,11 @@
+pytest-homeassistant-custom-component
+# Imported by light.py via homeassistant.components.bluetooth, which pulls in usb
+bleak-retry-connector
+habluetooth
+bluetooth-adapters
+bluetooth-auto-recovery
+bluetooth-data-tools
+dbus-fast
+aiousbwatcher
+serialx
+govee-local-api>=3.0.0

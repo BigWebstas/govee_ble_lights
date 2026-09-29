@@ -1,4 +1,4 @@
-name: Linting
+name: Tests
 
 on:
   push:
@@ -10,44 +10,34 @@ on:
   schedule:
     - cron: "0 0 * * *"
 
-env:
-  DEFAULT_PYTHON: 3.9
-
 jobs:
-  pre-commit:
+  pytest:
     runs-on: "ubuntu-latest"
-    name: Pre-commit
+    name: Pytest
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v2.3.4
+        uses: actions/checkout@v4
 
-      - name: Set up Python {{ "${{ env.DEFAULT_PYTHON }}" }}
-        uses: actions/setup-python@v2.2.1
-        with:
-          python-version: {{ "${{ env.DEFAULT_PYTHON }}" }}
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
 
-      - name: Upgrade pip
+      - name: Install test requirements
         run: |
-          pip install --constraint=.github/workflows/constraints.txt pip
-          pip --version
+          uv venv -p 3.14
+          uv pip install -r requirements_test.txt
 
-      - name: Install Python modules
-        run: |
-          pip install --constraint=.github/workflows/constraints.txt pre-commit black flake8 reorder-python-imports
-
-      - name: Run pre-commit on all files
-        run: |
-          pre-commit run --all-files --show-diff-on-failure --color=always
+      - name: Run tests
+        run: uv run pytest
 
   hacs:
     runs-on: "ubuntu-latest"
     name: HACS
     steps:
       - name: Check out the repository
-        uses: "actions/checkout@v2.3.4"
+        uses: actions/checkout@v4
 
       - name: HACS validation
-        uses: "hacs/action@20.12.0"
+        uses: hacs/action@main
         with:
           category: "integration"
           ignore: brands
@@ -57,7 +47,7 @@ jobs:
     name: Hassfest
     steps:
       - name: Check out the repository
-        uses: "actions/checkout@v2.3.4"
+        uses: actions/checkout@v4
 
       - name: Hassfest validation
-        uses: "home-assistant/actions/hassfest@master"
+        uses: home-assistant/actions/hassfest@master
