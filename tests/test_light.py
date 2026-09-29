@@ -1,10 +1,10 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from homeassistant.components.light import ATTR_EFFECT
+from homeassistant.components.light import ATTR_EFFECT, ATTR_RGB_COLOR
 
 from custom_components.govee_ble_lights import light
-from custom_components.govee_ble_lights.light import GoveeBLEControlMixin, GoveeHybridLight
+from custom_components.govee_ble_lights.light import GoveeAPILight, GoveeBLEControlMixin, GoveeHybridLight
 
 DEVICE = {
     "sku": "H6095",
@@ -24,6 +24,15 @@ def _hybrid(lan_device):
     hub.api = AsyncMock()
     entity = GoveeHybridLight(hub, DEVICE, lan_device=MagicMock())
     entity._lan_device = lan_device
+    entity.async_write_ha_state = MagicMock()
+    return entity
+
+
+def _api_light():
+    hub = MagicMock()
+    hub.api = AsyncMock()
+    entity = GoveeAPILight(hub, DEVICE)
+    entity.async_write_ha_state = MagicMock()
     return entity
 
 
@@ -51,6 +60,20 @@ async def test_hybrid_effect_still_works_after_lan_lost():
         await entity.async_turn_on(**{ATTR_EFFECT: "Aurora"})
 
     entity.hub.api.set_scene.assert_awaited_once()
+
+
+@pytest.mark.parametrize("make_entity", [lambda: _hybrid(AsyncMock()), _api_light])
+async def test_active_effect_shown_then_cleared_by_color(make_entity):
+    entity = make_entity()
+    scene = {"name": "Aurora", "value": {"id": 1, "paramId": 2}}
+
+    with patch.object(light, "_resolve_cloud_scene", AsyncMock(return_value=scene)):
+        await entity.async_turn_on(**{ATTR_EFFECT: "Aurora"})
+    assert entity.effect == "Aurora"
+    entity.async_write_ha_state.assert_called()
+
+    await entity.async_turn_on(**{ATTR_RGB_COLOR: (255, 0, 0)})
+    assert entity.effect is None
 
 
 def test_hybrid_effect_list_kept_after_lan_lost():

@@ -270,10 +270,12 @@ class GoveeAPILight(CoordinatorEntity, LightEntity):
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
             await self.hub.api.set_color_rgb(self.sku, self.device, red, green, blue)
+            self._attr_effect = None
 
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             kelvin = kwargs.get(ATTR_COLOR_TEMP_KELVIN)
             await self.hub.api.set_color_temp(self.sku, self.device, kelvin)
+            self._attr_effect = None
 
         if ATTR_EFFECT in kwargs:
             effect_name = kwargs.get(ATTR_EFFECT)
@@ -281,8 +283,11 @@ class GoveeAPILight(CoordinatorEntity, LightEntity):
             _LOGGER.info("Set scene: %s", scene)
             instance = 'diyScene' if isinstance(scene['value'], int) else 'lightScene'
             await self.hub.api.set_scene(self.sku, self.device, scene['value'], instance)
+            self._attr_effect = effect_name
 
         await self.hub.api.toggle_power(self.sku, self.device, 1)
+        # Govee's state endpoint doesn't report the active scene, so it's tracked optimistically.
+        self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
         await self.hub.api.toggle_power(self.sku, self.device, 0)
@@ -635,6 +640,13 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
 
         await self._write_ble_commands(self._build_ble_on_commands(**kwargs))
 
+        # BLE has no state read-back, so the active scene is tracked optimistically.
+        if kwargs.get(ATTR_EFFECT):
+            self._attr_effect = kwargs[ATTR_EFFECT]
+        elif ATTR_RGB_COLOR in kwargs:
+            self._attr_effect = None
+        self.async_write_ha_state()
+
     async def async_turn_off(self, **kwargs) -> None:
         await self._write_ble_commands([self._build_ble_off_command()])
         self._state = False
@@ -807,6 +819,16 @@ class GoveeHybridLight(CoordinatorEntity, LightEntity):
         self.hass.async_create_task(self.coordinator.async_request_refresh())
 
     async def async_turn_on(self, **kwargs) -> None:
+        await self._send_turn_on(**kwargs)
+
+        # Neither LAN nor cloud state reports the active scene, so it's tracked optimistically.
+        if ATTR_EFFECT in kwargs:
+            self._attr_effect = kwargs[ATTR_EFFECT]
+        elif ATTR_RGB_COLOR in kwargs:
+            self._attr_effect = None
+        self.async_write_ha_state()
+
+    async def _send_turn_on(self, **kwargs) -> None:
         self._refresh_lan_device()
         self._state = True
 
