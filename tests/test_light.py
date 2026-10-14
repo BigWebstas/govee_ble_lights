@@ -106,7 +106,15 @@ def test_effect_map_disambiguates_duplicate_names():
     assert names == ["Halloween (Festival)", "Halloween (Festival) #2", "Party", "Halloween (Nature)"]
 
 
-@pytest.mark.parametrize("model", ["H6095", "H3501", "H7093"])
+def test_ble_effect_list_is_sorted_alphabetically():
+    catalog = {"data": {"categories": [
+        {"categoryName": "A", "scenes": [_scene("zebra"), _scene("Apple"), _scene("banana")]},
+    ]}}
+
+    assert _Catalog("H6095", catalog)._local_ble_effect_list() == ["Apple", "banana", "zebra"]
+
+
+@pytest.mark.parametrize("model", ["H6095", "H3501", "H7093", "H70B1"])
 def test_shipped_catalog_resolves_every_effect(model):
     catalog = _Catalog(model)
     effect_map = catalog._effect_map()

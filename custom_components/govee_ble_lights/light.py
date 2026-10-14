@@ -86,6 +86,7 @@ async def _load_cloud_scenes(hass: HomeAssistant, hub: Hub, sku: str, device: st
             _LOGGER.exception("Failed to load DIY scenes for %s", sku)
 
     store = Store(hass, 1, f"{DOMAIN}/effect_list_{sku}.json")
+    scenes.sort(key=lambda scene: scene['name'].casefold())
     await store.async_save(scenes)
     return scenes
 
@@ -506,7 +507,7 @@ class GoveeBLEControlMixin:
         return lightEffect['specialEffect'][seffectIdx]['scenceParam']
 
     def _local_ble_effect_list(self) -> list[str]:
-        return list(self._effect_map().keys())
+        return sorted(self._effect_map(), key=str.casefold)
 
     def _build_ble_on_commands(self, **kwargs) -> list[bytes]:
         commands = [self._prepareSinglePacketData(LedCommand.POWER, [0x1])]
