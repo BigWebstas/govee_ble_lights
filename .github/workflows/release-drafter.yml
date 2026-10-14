@@ -4,6 +4,11 @@ on:
     branches:
       - main
       - master
+
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   draft_release:
     name: Release Drafter
@@ -12,4 +17,4 @@ jobs:
       - name: Run release-drafter
         uses: release-drafter/release-drafter@v5.13.0
         env:
-          GITHUB_TOKEN: {{ "${{ secrets.GITHUB_TOKEN }}" }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
