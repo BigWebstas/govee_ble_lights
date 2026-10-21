@@ -308,7 +308,7 @@ async def test_silent_light_gets_plain_frames_and_is_not_pinned(ble):
 
 
 @pytest.mark.parametrize("model,ha_value,byte", [("H70B1", 38, 15), ("H3501", 255, 100), ("H619D", 128, 50),
-                                                 ("H705A", 38, 38), ("H705A", 255, 255)])
+                                                 ("H705A", 51, 20), ("H705A", 255, 100), ("H6159", 38, 38)])
 def test_ble_brightness_byte_matches_the_lights_scale(model, ha_value, byte):
     light_ = object.__new__(GoveeBLEControlMixin)
     light_._model = model
