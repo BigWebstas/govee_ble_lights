@@ -23,6 +23,8 @@ from .const import DOMAIN
 from pathlib import Path
 import json
 from .coordinator import SCAN_INTERVAL
+from .govee_crypto import (ENCRYPTION_VERSION_AES_GCM, EncryptedSession, GoveeCryptoError,
+                           parse_encryption_version)
 from .govee_utils import prepareMultiplePacketsData
 import base64
 import homeassistant.util.dt as dt_util
@@ -31,8 +33,12 @@ from . import Hub
 _LOGGER = logging.getLogger(__name__)
 
 UUID_CONTROL_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b11'
+UUID_NOTIFY_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b10'
+UUID_ENCRYPTION_VERSION = '00010203-0405-0607-0809-0a0b0c0d2b12'
 # Seconds to wait after the last unacknowledged write before disconnecting.
 BLE_DISCONNECT_DELAY = 0.3
+# Seconds to wait for the light's reply to the encrypted key exchange.
+BLE_HANDSHAKE_TIMEOUT = 5
 # Models whose scene upload is framed as [0x0c, type + 0x3b] + payload[1:] instead of
 # [0x02] + payload (confirmed for H70B1 from a Govee Home app capture).
 PICTURE_SCENE_MODELS = ['H70B1']
@@ -564,12 +570,37 @@ class GoveeBLEControlMixin:
         async with self._ble_lock:
             client = await self._connectBluetooth()
             try:
+                session = await self._open_encrypted_session(client)
                 for command in commands:
-                    await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
+                    await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC,
+                                                 session.seal(command) if session else command, False)
                 # Writes are unacknowledged; let the last packets leave before hanging up.
                 await asyncio.sleep(BLE_DISCONNECT_DELAY)
             finally:
                 await client.disconnect()
+
+    async def _open_encrypted_session(self, client: BleakClient) -> EncryptedSession | None:
+        """Run the key exchange if the light reports encryption version 2; None means plain frames."""
+        try:
+            marker = await client.read_gatt_char(UUID_ENCRYPTION_VERSION)
+        except Exception:  # characteristic absent: a plain-protocol light
+            return None
+        if parse_encryption_version(marker) != ENCRYPTION_VERSION_AES_GCM:
+            return None
+
+        session = EncryptedSession()
+        replies: asyncio.Queue[bytes] = asyncio.Queue()
+        await client.start_notify(UUID_NOTIFY_CHARACTERISTIC, lambda _, data: replies.put_nowait(bytes(data)))
+        await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, session.handshake_request(), False)
+        try:
+            async with asyncio.timeout(BLE_HANDSHAKE_TIMEOUT):
+                while True:
+                    reply = await replies.get()
+                    if session.is_handshake_response(reply):
+                        session.accept_handshake_response(reply)
+                        return session
+        except (TimeoutError, GoveeCryptoError) as err:
+            raise ConnectionError(f"Encrypted handshake with {self.unique_id} failed: {err!r}") from err
 
     async def _connectBluetooth(self) -> BleakClient:
         # Re-resolve the device on every connect: the adapter or proxy that hears the light can

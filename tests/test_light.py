@@ -154,7 +154,8 @@ def _make_ble_light():
 @pytest.fixture
 def ble(monkeypatch):
     """Patch the Bluetooth stack; return (client, establish_connection mock, device lookup mock)."""
-    client = MagicMock(write_gatt_char=AsyncMock(), disconnect=AsyncMock())
+    client = MagicMock(write_gatt_char=AsyncMock(), disconnect=AsyncMock(),
+                       read_gatt_char=AsyncMock(side_effect=KeyError("no 2b12")))
     establish = AsyncMock(return_value=client)
     lookup = MagicMock(return_value="fresh-device")
     monkeypatch.setattr(light.bleak_retry_connector, "establish_connection", establish)
@@ -207,3 +208,49 @@ async def test_ble_falls_back_to_cached_device(ble):
 
     assert establish.call_args.args[1] == "cached-device"
     assert entity.is_on is True
+
+
+async def test_encrypted_light_gets_handshake_then_sealed_frames(ble):
+    from custom_components.govee_ble_lights import govee_crypto as gc
+
+    client, *_ = ble
+    client.read_gatt_char = AsyncMock(return_value=bytes.fromhex("0102") + bytes(18))
+    captured = {}
+
+    async def start_notify(_uuid, callback):
+        captured["notify"] = callback
+
+    writes = []
+
+    async def write(_uuid, data, _response):
+        writes.append(bytes(data))
+        if len(writes) == 1:  # the handshake request: answer as a light would
+            iv = bytes(range(12))
+            header = bytes([0xE7, 0x11, 0x00]) + iv
+            payload = bytes(8) + b"H3501" + bytes(6)
+            captured["notify"](None, header + gc._gcm_encrypt(gc.KEY_HANDSHAKE, iv, payload, header))
+
+    client.start_notify = start_notify
+    client.write_gatt_char = write
+    entity = _make_ble_light()
+
+    await entity.async_turn_off()
+
+    plain = entity._build_ble_off_command()
+    assert writes[0][:3] == bytes([0xE7, 0x11, 0x01])
+    assert len(writes) == 2 and writes[1] != plain and len(writes[1]) == 4 + 20 + gc.TAG_LEN
+    assert entity.is_on is False
+
+
+async def test_encrypted_handshake_timeout_raises_and_keeps_state(ble, monkeypatch):
+    client, *_ = ble
+    client.read_gatt_char = AsyncMock(return_value=bytes.fromhex("0102"))
+    client.start_notify = AsyncMock()
+    monkeypatch.setattr(light, "BLE_HANDSHAKE_TIMEOUT", 0.01)
+    entity = _make_ble_light()
+
+    with pytest.raises(ConnectionError, match="handshake"):
+        await entity.async_turn_on()
+
+    assert entity.is_on is None
+    client.disconnect.assert_awaited_once()
