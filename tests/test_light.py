@@ -1,3 +1,4 @@
+import base64
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -122,3 +123,20 @@ def test_shipped_catalog_resolves_every_effect(model):
     assert effect_map
     for indexes in effect_map.values():
         assert catalog._resolve_effect_param(*indexes)
+
+
+def test_h70b1_scene_matches_govee_app_capture():
+    # Greedy Snake as captured from the Govee Home app over BLE.
+    light_ = object.__new__(GoveeBLEControlMixin)
+    light_._model = "H70B1"
+    catalog = _Catalog("H70B1")
+    name = "Greedy Snake"
+    scene = base64.b64decode(catalog._resolve_effect_param(*catalog._effect_map()[name]))
+
+    packets = [bytes(p).hex() for p in light_._build_scene_packets(scene)]
+
+    assert packets == [
+        "a30001030c541d000303320f08ff0000ff7f00ae",
+        "a301ffff0000ff000000ff00ffff8b00ffffffd6",
+        "a3ffff00000000000000000000000000000000a3",
+    ]

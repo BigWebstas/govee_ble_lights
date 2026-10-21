@@ -30,6 +30,10 @@ from . import Hub
 _LOGGER = logging.getLogger(__name__)
 
 UUID_CONTROL_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b11'
+# Models whose scene upload is framed as [0x0c, type + 0x3b] + payload[1:] instead of
+# [0x02] + payload (confirmed for H70B1 from a Govee Home app capture).
+PICTURE_SCENE_MODELS = ['H70B1']
+
 SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199', 'H70B1', 'H6095', 'H7092', 'H619D']
 
 class LedCommand(IntEnum):
@@ -533,15 +537,17 @@ class GoveeBLEControlMixin:
                 scene_param = self._resolve_effect_param(categoryIndex, sceneIndex, lightEffectIndex,
                                                          specialEffectIndex)
 
-                # Prepare packets to send big payload in separated chunks
-                for command in prepareMultiplePacketsData(0xa3,
-                                                          array.array('B', [0x02]),
-                                                          array.array('B',
-                                                                      base64.b64decode(scene_param)
-                                                                      )):
-                    commands.append(command)
+                commands.extend(self._build_scene_packets(base64.b64decode(scene_param)))
 
         return commands
+
+    def _build_scene_packets(self, scene: bytes) -> list:
+        """Split a catalog scene payload into the chunked 0xa3 packets the light expects."""
+        if self._model in PICTURE_SCENE_MODELS:
+            header, scene = [], bytes([0x0c, scene[0] + 0x3b]) + scene[1:]
+        else:
+            header = [0x02]
+        return prepareMultiplePacketsData(0xa3, array.array('B', header), array.array('B', scene))
 
     def _build_ble_off_command(self) -> bytes:
         return self._prepareSinglePacketData(LedCommand.POWER, [0x0])
