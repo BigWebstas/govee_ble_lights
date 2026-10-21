@@ -305,3 +305,15 @@ async def test_silent_light_gets_plain_frames_and_is_not_pinned(ble):
     plain = entity._build_ble_off_command()
     assert client.write_gatt_char.await_args_list[-1].args[1] == plain
     assert entity._ble_scheme is None
+
+
+@pytest.mark.parametrize("model,ha_value,byte", [("H70B1", 38, 15), ("H3501", 255, 100), ("H619D", 128, 50),
+                                                 ("H705A", 38, 38), ("H705A", 255, 255)])
+def test_ble_brightness_byte_matches_the_lights_scale(model, ha_value, byte):
+    light_ = object.__new__(GoveeBLEControlMixin)
+    light_._model = model
+    light_._is_segmented = False
+
+    commands = light_._build_ble_on_commands(brightness=ha_value)
+
+    assert commands[1][1] == 0x04 and commands[1][2] == byte
