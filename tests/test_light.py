@@ -155,12 +155,14 @@ def _make_ble_light():
 def ble(monkeypatch):
     """Patch the Bluetooth stack; return (client, establish_connection mock, device lookup mock)."""
     client = MagicMock(write_gatt_char=AsyncMock(), disconnect=AsyncMock(),
-                       read_gatt_char=AsyncMock(side_effect=KeyError("no 2b12")))
+                       read_gatt_char=AsyncMock(side_effect=KeyError("no 2b12")),
+                       start_notify=AsyncMock())
     establish = AsyncMock(return_value=client)
     lookup = MagicMock(return_value="fresh-device")
     monkeypatch.setattr(light.bleak_retry_connector, "establish_connection", establish)
     monkeypatch.setattr(light.bluetooth, "async_ble_device_from_address", lookup)
     monkeypatch.setattr(light, "BLE_DISCONNECT_DELAY", 0)
+    monkeypatch.setattr(light, "BLE_PROBE_TIMEOUT", 0.01)
     return client, establish, lookup
 
 
@@ -172,7 +174,7 @@ async def test_ble_write_uses_fresh_device_and_disconnects(ble):
 
     lookup.assert_called_once_with(entity.hass, "AA:BB:CC:DD:EE:FF", True)
     assert establish.call_args.args[1] == "fresh-device"
-    client.write_gatt_char.assert_awaited_once()
+    assert client.write_gatt_char.await_count == 2  # v1 probe (unanswered), then the plain command
     client.disconnect.assert_awaited_once()
     assert entity.is_on is False
 
@@ -254,3 +256,52 @@ async def test_encrypted_handshake_timeout_raises_and_keeps_state(ble, monkeypat
 
     assert entity.is_on is None
     client.disconnect.assert_awaited_once()
+
+
+def _legacy_light_reply(request: bytes, key: bytes) -> bytes:
+    from custom_components.govee_ble_lights import govee_crypto as gc
+
+    body = bytes([0xE7, 0x01]) + key + b"\0"
+    return gc._ecb_rc4(gc.KEY_COMM, body + bytes([gc._xor_checksum(body)]), True)
+
+
+async def test_legacy_encrypted_light_is_detected_and_sealed(ble):
+    from custom_components.govee_ble_lights import govee_crypto as gc
+
+    client, *_ = ble
+    key = bytes(range(16))
+    captured = {}
+    writes = []
+
+    async def start_notify(_uuid, callback):
+        captured["notify"] = callback
+
+    async def write(_uuid, data, _response):
+        writes.append(bytes(data))
+        if len(writes) % 3 == 1:  # round 1 of each connection: the light answers with its session key
+            captured["notify"](None, _legacy_light_reply(bytes(data), key))
+
+    client.start_notify = start_notify
+    client.write_gatt_char = write
+    entity = _make_ble_light()
+
+    await entity.async_turn_off()
+
+    plain = entity._build_ble_off_command()
+    assert len(writes) == 3  # request, confirm, command
+    assert writes[2] == gc._ecb_rc4(key, plain, True) != plain
+    assert entity._ble_scheme == "v1"
+
+    await entity.async_turn_off()  # known scheme: a fresh handshake on the next connection
+    assert len(writes) == 6 and entity._ble_scheme == "v1"
+
+
+async def test_silent_light_gets_plain_frames_and_is_not_pinned(ble):
+    client, *_ = ble
+    entity = _make_ble_light()
+
+    await entity.async_turn_off()
+
+    plain = entity._build_ble_off_command()
+    assert client.write_gatt_char.await_args_list[-1].args[1] == plain
+    assert entity._ble_scheme is None

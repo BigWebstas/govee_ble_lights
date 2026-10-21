@@ -107,3 +107,83 @@ class EncryptedSession:
         counter = struct.pack(">I", self._counter)
         self._counter += 1
         return counter + _gcm_encrypt(self._device_key, self._client_iv_key + counter, bytes(frame), counter)
+
+
+# --- Version 1: AES-ECB + RC4, no marker characteristic ------------------------------------------
+# The first encrypted generation. The light hands out its session key during a two-round handshake
+# protected by an app-global constant. Frames stay 20 bytes: whole 16-byte blocks go through
+# AES-ECB and the trailing bytes are XORed with an RC4 keystream under the same key. Confirmed on
+# an H7093, H6095 and H619D; documented in section 10 of the PROTOCOL.md credited above.
+
+KEY_COMM = b"MakingLifeSmarte"
+CMD_KEY_REQUEST = 0x01
+CMD_KEY_CONFIRM = 0x02
+FRAME_LEN = 20
+
+
+def _xor_checksum(data: bytes) -> int:
+    checksum = 0
+    for byte in data:
+        checksum ^= byte
+    return checksum
+
+
+def _rc4(key: bytes, data: bytes) -> bytes:
+    state = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + state[i] + key[i % len(key)]) & 0xFF
+        state[i], state[j] = state[j], state[i]
+    out = bytearray()
+    i = j = 0
+    for byte in data:
+        i = (i + 1) & 0xFF
+        j = (j + state[i]) & 0xFF
+        state[i], state[j] = state[j], state[i]
+        out.append(byte ^ state[(state[i] + state[j]) & 0xFF])
+    return bytes(out)
+
+
+def _ecb_rc4(key: bytes, frame: bytes, encrypt: bool) -> bytes:
+    """The same transform seals and opens a frame: ECB over whole blocks, RC4 over the tail."""
+    whole = len(frame) // 16 * 16
+    cipher = Cipher(algorithms.AES(key), modes.ECB())  # noqa: S305
+    ctx = cipher.encryptor() if encrypt else cipher.decryptor()
+    return ctx.update(frame[:whole]) + ctx.finalize() + _rc4(key, frame[whole:])
+
+
+class LegacyEncryptedSession:
+    """Key exchange and frame sealing for lights without the 2b12 marker that still ignore plain frames.
+
+    Flow: write `handshake_request()`, feed the reply to `accept_handshake_response()`, write
+    `confirm_request()`, then wrap every 20-byte command frame with `seal()`.
+    """
+
+    def __init__(self) -> None:
+        self._key: bytes | None = None
+
+    @staticmethod
+    def _handshake_frame(command: int) -> bytes:
+        body = bytes([MAGIC, command]) + os.urandom(17)
+        return _ecb_rc4(KEY_COMM, body + bytes([_xor_checksum(body)]), True)
+
+    def handshake_request(self) -> bytes:
+        return self._handshake_frame(CMD_KEY_REQUEST)
+
+    def confirm_request(self) -> bytes:
+        return self._handshake_frame(CMD_KEY_CONFIRM)
+
+    def accept_handshake_response(self, frame: bytes) -> None:
+        """Take the session key from `plaintext[2:18]` of the light's first reply."""
+        frame = bytes(frame)
+        if len(frame) != FRAME_LEN:
+            raise GoveeCryptoError(f"unexpected reply length {len(frame)}")
+        plain = _ecb_rc4(KEY_COMM, frame, False)
+        if plain[0] != MAGIC or plain[1] != CMD_KEY_REQUEST or _xor_checksum(plain[:19]) != plain[19]:
+            raise GoveeCryptoError("not a key reply")
+        self._key = plain[2:18]
+
+    def seal(self, frame: bytes) -> bytes:
+        if self._key is None:
+            raise GoveeCryptoError("handshake not completed")
+        return _ecb_rc4(self._key, bytes(frame), True)

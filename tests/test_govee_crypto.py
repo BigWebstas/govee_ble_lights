@@ -80,3 +80,41 @@ def test_seal_requires_handshake():
                                             (bytes.fromhex("0101"), 1), (bytes.fromhex("0900"), 0)])
 def test_parse_encryption_version(marker, version):
     assert gc.parse_encryption_version(marker) == version
+
+
+def _legacy_reply(key: bytes) -> bytes:
+    body = bytes([0xE7, 0x01]) + key + b"\0"
+    return gc._ecb_rc4(gc.KEY_COMM, body + bytes([gc._xor_checksum(body)]), True)
+
+
+def test_legacy_session_seals_with_the_light_provided_key():
+    session = gc.LegacyEncryptedSession()
+    key = bytes(range(16))
+    session.accept_handshake_response(_legacy_reply(key))
+    frame = bytes.fromhex("3301010000000000000000000000000000000033")
+
+    sealed = session.seal(frame)
+
+    assert len(sealed) == 20 and sealed != frame
+    assert gc._ecb_rc4(key, sealed, False) == frame
+
+
+def test_legacy_handshake_frames_open_under_the_comm_key():
+    session = gc.LegacyEncryptedSession()
+
+    for build, command in ((session.handshake_request, 1), (session.confirm_request, 2)):
+        plain = gc._ecb_rc4(gc.KEY_COMM, build(), False)
+        assert plain[:2] == bytes([0xE7, command]) and gc._xor_checksum(plain[:19]) == plain[19]
+
+
+def test_legacy_rejects_bad_checksum_and_foreign_frames():
+    session = gc.LegacyEncryptedSession()
+    bad = bytearray(_legacy_reply(bytes(16)))
+    bad[0] ^= 1
+
+    with pytest.raises(gc.GoveeCryptoError):
+        session.accept_handshake_response(bytes(bad))
+    with pytest.raises(gc.GoveeCryptoError):
+        session.accept_handshake_response(b"\xaa\x01" + bytes(18))
+    with pytest.raises(gc.GoveeCryptoError):
+        session.seal(bytes(20))

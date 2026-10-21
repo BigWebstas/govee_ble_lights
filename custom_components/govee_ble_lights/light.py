@@ -23,7 +23,7 @@ from .const import DOMAIN
 from pathlib import Path
 import json
 from .coordinator import SCAN_INTERVAL
-from .govee_crypto import (ENCRYPTION_VERSION_AES_GCM, EncryptedSession, GoveeCryptoError,
+from .govee_crypto import (ENCRYPTION_VERSION_AES_GCM, EncryptedSession, GoveeCryptoError, LegacyEncryptedSession,
                            parse_encryption_version)
 from .govee_utils import prepareMultiplePacketsData
 import base64
@@ -37,8 +37,12 @@ UUID_NOTIFY_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b10'
 UUID_ENCRYPTION_VERSION = '00010203-0405-0607-0809-0a0b0c0d2b12'
 # Seconds to wait after the last unacknowledged write before disconnecting.
 BLE_DISCONNECT_DELAY = 0.3
-# Seconds to wait for the light's reply to the encrypted key exchange.
+# Seconds to wait for the reply to a key exchange with a light already known to be encrypted...
 BLE_HANDSHAKE_TIMEOUT = 5
+# ...and for the probe that finds out whether an unknown light is encrypted (real ones answer in ms).
+BLE_PROBE_TIMEOUT = 1.5
+BLE_SCHEME_V1 = 'v1'
+BLE_SCHEME_V2 = 'v2'
 # Models whose scene upload is framed as [0x0c, type + 0x3b] + payload[1:] instead of
 # [0x02] + payload (confirmed for H70B1 from a Govee Home app capture).
 PICTURE_SCENE_MODELS = ['H70B1']
@@ -579,28 +583,46 @@ class GoveeBLEControlMixin:
             finally:
                 await client.disconnect()
 
-    async def _open_encrypted_session(self, client: BleakClient) -> EncryptedSession | None:
-        """Run the key exchange if the light reports encryption version 2; None means plain frames."""
-        try:
-            marker = await client.read_gatt_char(UUID_ENCRYPTION_VERSION)
-        except Exception:  # characteristic absent: a plain-protocol light
-            return None
-        if parse_encryption_version(marker) != ENCRYPTION_VERSION_AES_GCM:
-            return None
+    async def _open_encrypted_session(self, client: BleakClient) -> EncryptedSession | LegacyEncryptedSession | None:
+        """Run the key exchange the light needs; None means it takes plain frames.
 
-        session = EncryptedSession()
+        Version 2 lights say so on 2b12. Version 1 lights have no marker and ignore plain frames
+        silently, so an unknown light is probed with the v1 request: a reply means v1, silence means
+        plain. Only a positive result is remembered, so one missed reply cannot pin an encrypted
+        light to plain frames.
+        """
+        if self._ble_scheme is None and await self._reports_encryption_v2(client):
+            self._ble_scheme = BLE_SCHEME_V2
+        probing = self._ble_scheme is None
+        session = EncryptedSession() if self._ble_scheme == BLE_SCHEME_V2 else LegacyEncryptedSession()
+
         replies: asyncio.Queue[bytes] = asyncio.Queue()
         await client.start_notify(UUID_NOTIFY_CHARACTERISTIC, lambda _, data: replies.put_nowait(bytes(data)))
         await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, session.handshake_request(), False)
         try:
-            async with asyncio.timeout(BLE_HANDSHAKE_TIMEOUT):
+            async with asyncio.timeout(BLE_PROBE_TIMEOUT if probing else BLE_HANDSHAKE_TIMEOUT):
                 while True:
-                    reply = await replies.get()
-                    if session.is_handshake_response(reply):
-                        session.accept_handshake_response(reply)
-                        return session
-        except (TimeoutError, GoveeCryptoError) as err:
-            raise ConnectionError(f"Encrypted handshake with {self.unique_id} failed: {err!r}") from err
+                    try:
+                        session.accept_handshake_response(await replies.get())
+                        break
+                    except GoveeCryptoError as err:  # not the reply we are waiting for
+                        _LOGGER.debug("Ignoring notification from %s during handshake: %s", self.unique_id, err)
+        except TimeoutError as err:
+            if probing:
+                return None
+            raise ConnectionError(f"Encrypted handshake with {self.unique_id} timed out") from err
+
+        if isinstance(session, LegacyEncryptedSession):
+            self._ble_scheme = BLE_SCHEME_V1
+            await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, session.confirm_request(), False)
+        return session
+
+    async def _reports_encryption_v2(self, client: BleakClient) -> bool:
+        try:
+            marker = await client.read_gatt_char(UUID_ENCRYPTION_VERSION)
+        except Exception:  # characteristic absent: not a version 2 light
+            return False
+        return parse_encryption_version(marker) == ENCRYPTION_VERSION_AES_GCM
 
     async def _connectBluetooth(self) -> BleakClient:
         # Re-resolve the device on every connect: the adapter or proxy that hears the light can
@@ -655,6 +677,7 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
         self._is_segmented = self._model in SEGMENTED_MODELS
         self._ble_device = ble_device
         self._ble_lock = asyncio.Lock()
+        self._ble_scheme: str | None = None  # BLE_SCHEME_*, learned from the first successful handshake
         self._state = None
         self._brightness = None
 
