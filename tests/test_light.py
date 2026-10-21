@@ -140,3 +140,70 @@ def test_h70b1_scene_matches_govee_app_capture():
         "a301ffff0000ff000000ff00ffff8b00ffffffd6",
         "a3ffff00000000000000000000000000000000a3",
     ]
+
+
+def _make_ble_light():
+    hub = MagicMock(address="AA:BB:CC:DD:EE:FF")
+    entry = MagicMock(data={"model": "H705A"})
+    entity = light.GoveeBluetoothLight(hub, "cached-device", entry)
+    entity.hass = MagicMock()
+    entity.async_write_ha_state = MagicMock()
+    return entity
+
+
+@pytest.fixture
+def ble(monkeypatch):
+    """Patch the Bluetooth stack; return (client, establish_connection mock, device lookup mock)."""
+    client = MagicMock(write_gatt_char=AsyncMock(), disconnect=AsyncMock())
+    establish = AsyncMock(return_value=client)
+    lookup = MagicMock(return_value="fresh-device")
+    monkeypatch.setattr(light.bleak_retry_connector, "establish_connection", establish)
+    monkeypatch.setattr(light.bluetooth, "async_ble_device_from_address", lookup)
+    monkeypatch.setattr(light, "BLE_DISCONNECT_DELAY", 0)
+    return client, establish, lookup
+
+
+async def test_ble_write_uses_fresh_device_and_disconnects(ble):
+    client, establish, lookup = ble
+    entity = _make_ble_light()
+
+    await entity.async_turn_off()
+
+    lookup.assert_called_once_with(entity.hass, "AA:BB:CC:DD:EE:FF", True)
+    assert establish.call_args.args[1] == "fresh-device"
+    client.write_gatt_char.assert_awaited_once()
+    client.disconnect.assert_awaited_once()
+    assert entity.is_on is False
+
+
+async def test_ble_disconnects_even_when_write_fails(ble):
+    client, *_ = ble
+    client.write_gatt_char.side_effect = OSError("boom")
+    entity = _make_ble_light()
+
+    with pytest.raises(OSError):
+        await entity.async_turn_off()
+
+    client.disconnect.assert_awaited_once()
+
+
+async def test_ble_state_unchanged_when_connect_fails(ble):
+    _, establish, _ = ble
+    establish.side_effect = OSError("no link")
+    entity = _make_ble_light()
+
+    with pytest.raises(ConnectionError):
+        await entity.async_turn_on()
+
+    assert entity.is_on is None
+
+
+async def test_ble_falls_back_to_cached_device(ble):
+    _, establish, lookup = ble
+    lookup.return_value = None
+    entity = _make_ble_light()
+
+    await entity.async_turn_on()
+
+    assert establish.call_args.args[1] == "cached-device"
+    assert entity.is_on is True

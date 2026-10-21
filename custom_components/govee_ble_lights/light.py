@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import array
+import asyncio
 import logging
 
 from enum import IntEnum
@@ -30,6 +31,8 @@ from . import Hub
 _LOGGER = logging.getLogger(__name__)
 
 UUID_CONTROL_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b11'
+# Seconds to wait after the last unacknowledged write before disconnecting.
+BLE_DISCONNECT_DELAY = 0.3
 # Models whose scene upload is framed as [0x0c, type + 0x3b] + payload[1:] instead of
 # [0x02] + payload (confirmed for H70B1 from a Govee Home app capture).
 PICTURE_SCENE_MODELS = ['H70B1']
@@ -553,15 +556,31 @@ class GoveeBLEControlMixin:
         return self._prepareSinglePacketData(LedCommand.POWER, [0x0])
 
     async def _write_ble_commands(self, commands: list[bytes]) -> None:
-        client = await self._connectBluetooth()
-        for command in commands:
-            await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
+        """Connect, write every command, then release the link.
+
+        A light accepts one connection at a time and adapters/proxies have few slots, so the
+        link is closed after each batch instead of being held open for the entity's lifetime.
+        """
+        async with self._ble_lock:
+            client = await self._connectBluetooth()
+            try:
+                for command in commands:
+                    await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
+                # Writes are unacknowledged; let the last packets leave before hanging up.
+                await asyncio.sleep(BLE_DISCONNECT_DELAY)
+            finally:
+                await client.disconnect()
 
     async def _connectBluetooth(self) -> BleakClient:
+        # Re-resolve the device on every connect: the adapter or proxy that hears the light can
+        # change after setup, which leaves the BLEDevice cached at startup pointing nowhere.
+        ble_device = bluetooth.async_ble_device_from_address(self.hass, self._mac.upper(), True) or self._ble_device
+        if ble_device is None:
+            raise ConnectionError(f"No Bluetooth device found for {self.unique_id}")
         last_error: Exception | None = None
         for _ in range(3):
             try:
-                return await bleak_retry_connector.establish_connection(BleakClient, self._ble_device, self.unique_id)
+                return await bleak_retry_connector.establish_connection(BleakClient, ble_device, self.unique_id)
             except Exception as ex:
                 last_error = ex
                 continue
@@ -604,6 +623,7 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
         self._model = config_entry.data["model"]
         self._is_segmented = self._model in SEGMENTED_MODELS
         self._ble_device = ble_device
+        self._ble_lock = asyncio.Lock()
         self._state = None
         self._brightness = None
 
@@ -640,14 +660,13 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
         return self._local_ble_effect_list()
 
     async def async_turn_on(self, **kwargs) -> None:
-        self._state = True
-
-        if ATTR_BRIGHTNESS in kwargs:
-            self._brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
-
         await self._write_ble_commands(self._build_ble_on_commands(**kwargs))
 
-        # BLE has no state read-back, so the active scene is tracked optimistically.
+        # BLE has no state read-back, so state is tracked optimistically, but only once the
+        # write has gone out: a failed connect raises and leaves the shown state unchanged.
+        self._state = True
+        if ATTR_BRIGHTNESS in kwargs:
+            self._brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
         if kwargs.get(ATTR_EFFECT):
             self._attr_effect = kwargs[ATTR_EFFECT]
         elif ATTR_RGB_COLOR in kwargs:
@@ -657,6 +676,7 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
     async def async_turn_off(self, **kwargs) -> None:
         await self._write_ble_commands([self._build_ble_off_command()])
         self._state = False
+        self.async_write_ha_state()
 
 
 class GoveeHybridLight(CoordinatorEntity, LightEntity):
