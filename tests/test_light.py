@@ -2,6 +2,7 @@ import base64
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from bleak.exc import BleakCharacteristicNotFoundError
 from homeassistant.components.light import ATTR_EFFECT, ATTR_RGB_COLOR
 
 from custom_components.govee_ble_lights import light
@@ -155,7 +156,7 @@ def _make_ble_light():
 def ble(monkeypatch):
     """Patch the Bluetooth stack; return (client, establish_connection mock, device lookup mock)."""
     client = MagicMock(write_gatt_char=AsyncMock(), disconnect=AsyncMock(),
-                       read_gatt_char=AsyncMock(side_effect=KeyError("no 2b12")),
+                       read_gatt_char=AsyncMock(side_effect=BleakCharacteristicNotFoundError("2b12")),
                        start_notify=AsyncMock())
     establish = AsyncMock(return_value=client)
     lookup = MagicMock(return_value="fresh-device")
@@ -317,3 +318,70 @@ def test_ble_brightness_byte_matches_the_lights_scale(model, ha_value, byte):
     commands = light_._build_ble_on_commands(brightness=ha_value)
 
     assert commands[1][1] == 0x04 and commands[1][2] == byte
+
+
+async def test_silent_light_is_cached_as_plain_after_three_misses(ble):
+    client, *_ = ble
+    entity = _make_ble_light()
+
+    for _ in range(light.BLE_PLAIN_AFTER_MISSES):
+        assert entity._ble_scheme is None
+        await entity.async_turn_off()
+    assert entity._ble_scheme == "plain"
+
+    client.read_gatt_char.reset_mock()
+    client.start_notify.reset_mock()
+    client.write_gatt_char.reset_mock()
+    await entity.async_turn_off()
+
+    client.read_gatt_char.assert_not_awaited()
+    client.start_notify.assert_not_awaited()
+    client.write_gatt_char.assert_awaited_once()
+    assert client.write_gatt_char.await_args.args[1] == entity._build_ble_off_command()
+
+
+async def test_positive_detection_resets_the_miss_counter(ble):
+    client, *_ = ble
+    entity = _make_ble_light()
+    entity._ble_probe_misses = 2
+    captured = {}
+
+    async def start_notify(_uuid, callback):
+        captured["notify"] = callback
+
+    async def write(_uuid, data, _response):
+        if len(client.sent) % 3 == 0:
+            captured["notify"](None, _legacy_light_reply(bytes(data), bytes(range(16))))
+        client.sent.append(bytes(data))
+
+    client.sent = []
+    client.start_notify = start_notify
+    client.write_gatt_char = write
+
+    await entity.async_turn_off()
+
+    assert entity._ble_scheme == "v1" and entity._ble_probe_misses == 0
+
+
+async def test_flaky_marker_read_is_not_a_miss(ble):
+    client, *_ = ble
+    client.read_gatt_char = AsyncMock(side_effect=TimeoutError("flaky"))
+    entity = _make_ble_light()
+
+    with pytest.raises(TimeoutError):
+        await entity.async_turn_off()
+
+    assert entity._ble_probe_misses == 0 and entity._ble_scheme is None
+    client.write_gatt_char.assert_not_awaited()
+
+
+async def test_plain_cache_is_dropped_when_the_connection_fails(ble):
+    _, establish, _ = ble
+    establish.side_effect = OSError("gone")
+    entity = _make_ble_light()
+    entity._ble_scheme, entity._ble_probe_misses = "plain", 3
+
+    with pytest.raises(ConnectionError):
+        await entity.async_turn_off()
+
+    assert entity._ble_scheme is None and entity._ble_probe_misses == 0
