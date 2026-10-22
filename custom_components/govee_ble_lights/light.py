@@ -47,6 +47,8 @@ BLE_SCHEME_V2 = 'v2'
 BLE_SCHEME_PLAIN = 'plain'
 # Consecutive silent probes before a light is treated as plain and no longer probed.
 BLE_PLAIN_AFTER_MISSES = 3
+# Seconds to batch scheme changes before writing them to disk.
+BLE_SCHEME_SAVE_DELAY = 1
 # Models whose scene upload is framed as [0x0c, type + 0x3b] + payload[1:] instead of
 # [0x02] + payload (confirmed for H70B1 from a Govee Home app capture).
 PICTURE_SCENE_MODELS = ['H70B1']
@@ -571,27 +573,53 @@ class GoveeBLEControlMixin:
         return self._prepareSinglePacketData(LedCommand.POWER, [0x0])
 
     async def _write_ble_commands(self, commands: list[bytes]) -> None:
-        """Connect, write every command, then release the link.
+        """Connect and write every command; the link is closed in the background afterwards.
 
         A light accepts one connection at a time and adapters/proxies have few slots, so the
         link is closed after each batch instead of being held open for the entity's lifetime.
+        The lock stays held until the close finishes, so the caller returns without waiting for it
+        and the next batch still never overlaps the old connection.
         """
-        async with self._ble_lock:
+        await self._ble_lock.acquire()
+        handed_off = False
+        try:
+            client = await self._connectBluetooth()
             try:
-                client = await self._connectBluetooth()
-                try:
-                    session = await self._open_encrypted_session(client)
-                    for command in commands:
-                        await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC,
-                                                     session.seal(command) if session else command, False)
-                    # Writes are unacknowledged; let the last packets leave before hanging up.
-                    await asyncio.sleep(BLE_DISCONNECT_DELAY)
-                finally:
-                    await client.disconnect()
-            except Exception:
-                if self._ble_scheme == BLE_SCHEME_PLAIN:  # the "plain" guess may be wrong: detect again next time
-                    self._ble_scheme, self._ble_probe_misses = None, 0
+                session = await self._open_encrypted_session(client)
+                for command in commands:
+                    await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC,
+                                                 session.seal(command) if session else command, False)
+            except BaseException:
+                await client.disconnect()
                 raise
+            self._ble_close_task = asyncio.create_task(self._close_ble(client))
+            handed_off = True
+        except Exception:
+            if self._ble_scheme == BLE_SCHEME_PLAIN:  # the "plain" guess may be wrong: detect again next time
+                self._ble_probe_misses = 0
+                self._set_ble_scheme(None)
+            raise
+        finally:
+            if not handed_off:
+                self._ble_lock.release()
+
+    async def _close_ble(self, client: BleakClient) -> None:
+        """Let the last packets leave (writes are unacknowledged), hang up, then free the lock."""
+        try:
+            await asyncio.sleep(BLE_DISCONNECT_DELAY)
+            await client.disconnect()
+        except Exception as err:
+            _LOGGER.debug("Disconnecting %s failed: %s", self.unique_id, err)
+        finally:
+            self._ble_lock.release()
+
+    def _set_ble_scheme(self, scheme: str | None) -> None:
+        """Change the remembered scheme and persist it, so a restart does not re-learn it."""
+        if scheme == self._ble_scheme:
+            return
+        self._ble_scheme = scheme
+        if self._scheme_store is not None:
+            self._scheme_store.async_delay_save(lambda: {"scheme": self._ble_scheme}, BLE_SCHEME_SAVE_DELAY)
 
     async def _open_encrypted_session(self, client: BleakClient) -> EncryptedSession | LegacyEncryptedSession | None:
         """Run the key exchange the light needs; None means it takes plain frames.
@@ -605,7 +633,7 @@ class GoveeBLEControlMixin:
         if self._ble_scheme == BLE_SCHEME_PLAIN:
             return None
         if self._ble_scheme is None and await self._reports_encryption_v2(client):
-            self._ble_scheme = BLE_SCHEME_V2
+            self._set_ble_scheme(BLE_SCHEME_V2)
         probing = self._ble_scheme is None
         session = EncryptedSession() if self._ble_scheme == BLE_SCHEME_V2 else LegacyEncryptedSession()
 
@@ -624,13 +652,14 @@ class GoveeBLEControlMixin:
             if probing:
                 self._ble_probe_misses += 1
                 if self._ble_probe_misses >= BLE_PLAIN_AFTER_MISSES:
-                    self._ble_scheme = BLE_SCHEME_PLAIN
+                    self._set_ble_scheme(BLE_SCHEME_PLAIN)
                 return None
+            self._set_ble_scheme(None)  # a remembered scheme may be stale (e.g. firmware update): detect again
             raise ConnectionError(f"Encrypted handshake with {self.unique_id} timed out") from err
 
         self._ble_probe_misses = 0
         if isinstance(session, LegacyEncryptedSession):
-            self._ble_scheme = BLE_SCHEME_V1
+            self._set_ble_scheme(BLE_SCHEME_V1)
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, session.confirm_request(), False)
         return session
 
@@ -696,8 +725,22 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
         self._ble_lock = asyncio.Lock()
         self._ble_scheme: str | None = None  # BLE_SCHEME_*, learned from the first successful handshake
         self._ble_probe_misses = 0
+        self._ble_close_task: asyncio.Task | None = None
+        self._scheme_store: Store | None = None
         self._state = None
         self._brightness = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._scheme_store = Store(self.hass, 1, f"{DOMAIN}/ble_scheme_{self.unique_id}.json")
+        saved = await self._scheme_store.async_load()
+        if saved and saved.get("scheme") in (BLE_SCHEME_V1, BLE_SCHEME_V2, BLE_SCHEME_PLAIN):
+            self._ble_scheme = saved["scheme"]
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._ble_close_task is not None:
+            await self._ble_close_task  # never abandon a link half-closed
+        await super().async_will_remove_from_hass()
 
     @property
     def device_info(self) -> dict:

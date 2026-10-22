@@ -1,3 +1,4 @@
+import asyncio
 import base64
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -176,8 +177,62 @@ async def test_ble_write_uses_fresh_device_and_disconnects(ble):
     lookup.assert_called_once_with(entity.hass, "AA:BB:CC:DD:EE:FF", True)
     assert establish.call_args.args[1] == "fresh-device"
     assert client.write_gatt_char.await_count == 2  # v1 probe (unanswered), then the plain command
+    await entity._ble_close_task
     client.disconnect.assert_awaited_once()
     assert entity.is_on is False
+
+
+async def test_ble_call_returns_before_disconnect_and_lock_is_held_until_closed(ble):
+    client, *_ = ble
+    release = asyncio.Event()
+    client.disconnect.side_effect = release.wait
+    entity = _make_ble_light()
+
+    await entity.async_turn_off()
+
+    assert entity.is_on is False and entity._ble_lock.locked()  # returned while the link is still closing
+    release.set()
+    await entity._ble_close_task
+    client.disconnect.assert_awaited_once()
+    assert not entity._ble_lock.locked()
+
+
+async def test_next_command_waits_for_the_previous_link_to_close(ble):
+    client, establish, _ = ble
+    release = asyncio.Event()
+    client.disconnect.side_effect = release.wait
+    entity = _make_ble_light()
+    await entity.async_turn_off()
+
+    second = asyncio.create_task(entity.async_turn_on())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert establish.await_count == 1  # still blocked behind the closing link
+    release.set()
+    await second
+    assert establish.await_count == 2
+
+
+async def test_learned_scheme_is_saved_and_restored(ble, monkeypatch):
+    store = MagicMock(async_load=AsyncMock(return_value={"scheme": "v1"}), async_delay_save=MagicMock())
+    monkeypatch.setattr(light, "Store", MagicMock(return_value=store))
+    entity = _make_ble_light()
+
+    await entity.async_added_to_hass()
+    assert entity._ble_scheme == "v1"
+
+    entity._set_ble_scheme("plain")
+    assert store.async_delay_save.call_args.args[0]() == {"scheme": "plain"}
+
+
+async def test_garbage_in_the_store_is_ignored(ble, monkeypatch):
+    store = MagicMock(async_load=AsyncMock(return_value={"scheme": "rot13"}))
+    monkeypatch.setattr(light, "Store", MagicMock(return_value=store))
+    entity = _make_ble_light()
+
+    await entity.async_added_to_hass()
+
+    assert entity._ble_scheme is None
 
 
 async def test_ble_disconnects_even_when_write_fails(ble):
@@ -257,6 +312,7 @@ async def test_encrypted_handshake_timeout_raises_and_keeps_state(ble, monkeypat
 
     assert entity.is_on is None
     client.disconnect.assert_awaited_once()
+    assert entity._ble_scheme is None  # a remembered scheme that stops answering is forgotten
 
 
 def _legacy_light_reply(request: bytes, key: bytes) -> bytes:
