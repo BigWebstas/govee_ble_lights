@@ -493,6 +493,8 @@ class GoveeBLEControlMixin:
 
                     for seffectIdx in seffectIdxs:
                         name = lightEffect.get('scenceName') or scene['sceneName']
+                        if len(scene['lightEffects']) > 1 and scene['sceneName'] not in name:
+                            name = f"{scene['sceneName']} {name}"  # a lone "C" means nothing in the effect list
                         yield name, category['categoryName'], categoryIdx, sceneIdx, leffectIdx, seffectIdx
 
     def _effect_map(self) -> dict[str, tuple[int, int, int, int]]:

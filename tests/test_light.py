@@ -441,3 +441,13 @@ async def test_plain_cache_is_dropped_when_the_connection_fails(ble):
         await entity.async_turn_off()
 
     assert entity._ble_scheme is None and entity._ble_probe_misses == 0
+
+
+def test_scene_variants_are_named_after_their_scene():
+    entity = _make_ble_light()
+    entity._model = "H7093"
+
+    effects = entity.effect_list
+
+    assert {"Halloween A", "Halloween B", "Halloween C", "Christmas A", "Christmas B"} <= set(effects)
+    assert not {"A", "B", "C"} & set(effects)
