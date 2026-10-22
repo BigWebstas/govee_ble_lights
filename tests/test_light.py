@@ -451,3 +451,14 @@ def test_scene_variants_are_named_after_their_scene():
 
     assert {"Halloween A", "Halloween B", "Halloween C", "Christmas A", "Christmas B"} <= set(effects)
     assert not {"A", "B", "C"} & set(effects)
+
+
+def test_scene_catalog_is_parsed_once_and_effect_list_is_memoised():
+    light._read_catalog.cache_clear()
+    entity = _make_ble_light()
+
+    first = entity.effect_list
+    for _ in range(3):
+        assert entity.effect_list == first
+
+    assert light._read_catalog.cache_info().misses == 1

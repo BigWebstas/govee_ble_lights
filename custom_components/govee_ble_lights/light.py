@@ -3,6 +3,7 @@ from __future__ import annotations
 import array
 import asyncio
 import logging
+from functools import lru_cache
 
 from enum import IntEnum
 import bleak_retry_connector
@@ -158,6 +159,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                 async_add_entities(entities)
     elif hub.address is not None:
         ble_device = bluetooth.async_ble_device_from_address(hass, hub.address.upper(), False)
+        # Parse the scene catalog in the executor: the entity reads it on every state write.
+        await hass.async_add_executor_job(_read_catalog, config_entry.data["model"])
         async_add_entities([GoveeBluetoothLight(hub, ble_device, config_entry)])
     elif hub.lan_controller is not None:
         async_add_entities([GoveeLANLight(device) for device in hub.lan_controller.devices])
@@ -455,6 +458,12 @@ class GoveeLANLight(LightEntity):
         await self._device.turn_off()
 
 
+@lru_cache(maxsize=None)
+def _read_catalog(model: str) -> dict:
+    """Parse a model's scene catalog once; callers must treat the result as read-only."""
+    return json.loads((Path(__file__).parent / "jsons" / f"{model}.json").read_text())
+
+
 class GoveeBLEControlMixin:
     """Shared BLE packet-building and local effect-catalog logic.
 
@@ -464,7 +473,7 @@ class GoveeBLEControlMixin:
     """
 
     def _load_effects_json(self) -> dict:
-        return json.loads(Path(Path(__file__).parent / "jsons" / (self._model + ".json")).read_text())
+        return _read_catalog(self._model)
 
     def _iter_effects(self):
         """Yield (name, categoryName, categoryIdx, sceneIdx, lightEffectIdx, specialEffectIdx)
@@ -508,6 +517,9 @@ class GoveeBLEControlMixin:
         name is disambiguated with its category in parentheses when it collides with
         another, and with a counter on top of that for same-name-same-category scenes.
         """
+        cached = getattr(self, "_effect_map_cache", None)
+        if cached is not None:
+            return cached
         entries = list(self._iter_effects())
         counts: dict[str, int] = {}
         for name, *_ in entries:
@@ -522,6 +534,7 @@ class GoveeBLEControlMixin:
                     suffix += 1
                 label = f"{label} #{suffix}"
             mapping[label] = (categoryIdx, sceneIdx, leffectIdx, seffectIdx)
+        self._effect_map_cache = mapping
         return mapping
 
     def _resolve_effect_param(self, categoryIdx: int, sceneIdx: int, leffectIdx: int, seffectIdx: int) -> str:

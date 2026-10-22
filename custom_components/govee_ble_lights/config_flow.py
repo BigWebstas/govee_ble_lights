@@ -19,6 +19,10 @@ from .const import DOMAIN, CONF_TYPE_API, CONF_TYPE_BLE, CONF_TYPE_LAN, CONF_FIN
 from pathlib import Path
 import asyncio
 
+# Scanned at import time (HA imports integrations off the event loop), not on every flow start.
+_AVAILABLE_MODELS = sorted(file.stem for file in (Path(__file__).parent / "jsons").iterdir())
+
+
 class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
     CONNECTION_CLASS = config_entries.CONN_CLASS_CLOUD_POLL
@@ -30,19 +34,13 @@ class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._discovery_info: None = None
         self._discovered_device: None = None
         self._discovered_devices: dict[str, str] = {}
-        self._available_models: list[str] = []
+        self._available_models: list[str] = list(_AVAILABLE_MODELS)
         self._available_config_types: dict[str, str] = {
             CONF_TYPE_API: 'API',
             CONF_TYPE_BLE: 'BLE',
             CONF_TYPE_LAN: 'LAN',
         }
         self._discovered_lan_devices: dict[str, tuple[str, str]] = {}
-
-        jsons_path = Path(Path(__file__).parent / "jsons")
-        for file in jsons_path.iterdir():
-            self._available_models.append(file.name.replace(".json", ""))
-
-        self._available_models.sort()
 
     async def async_step_bluetooth(
             self, discovery_info: BluetoothServiceInfoBleak
