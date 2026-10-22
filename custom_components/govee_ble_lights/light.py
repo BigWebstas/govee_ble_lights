@@ -47,11 +47,6 @@ BLE_SCHEME_V2 = 'v2'
 # [0x02] + payload (confirmed for H70B1 from a Govee Home app capture).
 PICTURE_SCENE_MODELS = ['H70B1']
 
-# Models whose BLE brightness byte is a 0-100 percentage. Most clamp at 100 on read-back; the H705A
-# stores any byte but the Govee app shows it as a percentage, so it is listed on that evidence.
-# Other models (older bulbs) keep taking the full 0-255 byte.
-PERCENT_BRIGHTNESS_MODELS = ['H70B1', 'H3501', 'H7093', 'H6095', 'H619D', 'H705A']
-
 SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199', 'H70B1', 'H6095', 'H7092', 'H619D']
 
 class LedCommand(IntEnum):
@@ -536,9 +531,8 @@ class GoveeBLEControlMixin:
 
         if ATTR_BRIGHTNESS in kwargs:
             brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
-            if self._model in PERCENT_BRIGHTNESS_MODELS:
-                brightness = round(brightness / 255 * 100)
-            commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
+            # The BLE brightness byte is a 0-100 percentage; Home Assistant's value is 0-255.
+            commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [round(brightness / 255 * 100)]))
 
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
