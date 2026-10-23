@@ -156,19 +156,20 @@ def _make_ble_light():
 @pytest.fixture
 def ble(monkeypatch):
     """Patch the Bluetooth stack; return (client, establish_connection mock, device lookup mock)."""
-    client = MagicMock(write_gatt_char=AsyncMock(), disconnect=AsyncMock(),
+    client = MagicMock(is_connected=True, write_gatt_char=AsyncMock(), disconnect=AsyncMock(),
                        read_gatt_char=AsyncMock(side_effect=BleakCharacteristicNotFoundError("2b12")),
                        start_notify=AsyncMock())
     establish = AsyncMock(return_value=client)
     lookup = MagicMock(return_value="fresh-device")
     monkeypatch.setattr(light.bleak_retry_connector, "establish_connection", establish)
     monkeypatch.setattr(light.bluetooth, "async_ble_device_from_address", lookup)
-    monkeypatch.setattr(light, "BLE_DISCONNECT_DELAY", 0)
+    monkeypatch.setattr(light, "BLE_IDLE_HOLD", 60)  # tests that want the idle close shorten it
+    monkeypatch.setattr(light, "BLE_SEGMENT_BATCH_WINDOW", 0.01)
     monkeypatch.setattr(light, "BLE_PROBE_TIMEOUT", 0.01)
     return client, establish, lookup
 
 
-async def test_ble_write_uses_fresh_device_and_disconnects(ble):
+async def test_ble_write_uses_fresh_device_and_keeps_link_open(ble):
     client, establish, lookup = ble
     entity = _make_ble_light()
 
@@ -177,40 +178,110 @@ async def test_ble_write_uses_fresh_device_and_disconnects(ble):
     lookup.assert_called_once_with(entity.hass, "AA:BB:CC:DD:EE:FF", True)
     assert establish.call_args.args[1] == "fresh-device"
     assert client.write_gatt_char.await_count == 2  # v1 probe (unanswered), then the plain command
-    await entity._ble_close_task
-    client.disconnect.assert_awaited_once()
+    client.disconnect.assert_not_awaited()  # held open for the next command
     assert entity.is_on is False
-
-
-async def test_ble_call_returns_before_disconnect_and_lock_is_held_until_closed(ble):
-    client, *_ = ble
-    release = asyncio.Event()
-    client.disconnect.side_effect = release.wait
-    entity = _make_ble_light()
-
-    await entity.async_turn_off()
-
-    assert entity.is_on is False and entity._ble_lock.locked()  # returned while the link is still closing
-    release.set()
-    await entity._ble_close_task
+    await entity._close_ble()
     client.disconnect.assert_awaited_once()
-    assert not entity._ble_lock.locked()
 
 
-async def test_next_command_waits_for_the_previous_link_to_close(ble):
+async def test_burst_of_commands_shares_one_connection(ble):
     client, establish, _ = ble
-    release = asyncio.Event()
-    client.disconnect.side_effect = release.wait
+    entity = _make_ble_light()
+
+    await entity.async_turn_off()
+    await entity.async_turn_on()
+
+    assert establish.await_count == 1
+    assert client.write_gatt_char.await_count == 3  # one probe, then a command per call
+    await entity._close_ble()
+
+
+async def test_link_closes_after_idle_hold(ble, monkeypatch):
+    client, *_ = ble
+    monkeypatch.setattr(light, "BLE_IDLE_HOLD", 0.01)
+    entity = _make_ble_light()
+
+    await entity.async_turn_off()
+    await asyncio.sleep(0.05)
+
+    client.disconnect.assert_awaited_once()
+    assert entity._ble_client is None
+
+
+async def test_new_command_pushes_back_the_idle_close(ble, monkeypatch):
+    client, establish, _ = ble
+    monkeypatch.setattr(light, "BLE_IDLE_HOLD", 0.05)
+    entity = _make_ble_light()
+
+    await entity.async_turn_off()
+    await asyncio.sleep(0.03)
+    await entity.async_turn_on()
+    await asyncio.sleep(0.03)
+
+    client.disconnect.assert_not_awaited()  # first timer was cancelled by the second write
+    assert establish.await_count == 1
+    await asyncio.sleep(0.05)
+    client.disconnect.assert_awaited_once()
+
+
+async def test_dropped_link_is_replaced_with_a_fresh_connection(ble):
+    client, establish, _ = ble
     entity = _make_ble_light()
     await entity.async_turn_off()
 
-    second = asyncio.create_task(entity.async_turn_on())
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    assert establish.await_count == 1  # still blocked behind the closing link
-    release.set()
-    await second
+    client.is_connected = False  # the light hung up while idle
+    await entity.async_turn_on()
+
     assert establish.await_count == 2
+    await entity._close_ble()
+
+
+async def test_failed_write_on_kept_link_retries_once_on_fresh_link(ble):
+    client, establish, _ = ble
+    entity = _make_ble_light()
+    entity._ble_scheme = "plain"
+    await entity.async_turn_off()  # link now kept
+
+    client.write_gatt_char.side_effect = [OSError("stale link"), None]
+    await entity.async_turn_on()
+
+    assert establish.await_count == 2
+    assert entity.is_on is True
+    await entity._close_ble()
+
+
+async def test_failed_write_on_fresh_link_is_not_retried(ble):
+    client, establish, _ = ble
+    client.write_gatt_char.side_effect = OSError("boom")
+    entity = _make_ble_light()
+
+    with pytest.raises(OSError):
+        await entity.async_turn_off()
+
+    assert establish.await_count == 1
+    client.disconnect.assert_awaited_once()
+    assert entity._ble_client is None
+
+
+async def test_connect_is_attempted_once(ble):
+    _, establish, _ = ble
+    establish.side_effect = OSError("no link")
+    entity = _make_ble_light()
+
+    with pytest.raises(ConnectionError):
+        await entity.async_turn_on()
+
+    assert establish.await_count == 1
+
+
+async def test_removal_closes_an_open_link(ble):
+    client, *_ = ble
+    entity = _make_ble_light()
+    await entity.async_turn_off()
+
+    await entity.async_will_remove_from_hass()
+
+    client.disconnect.assert_awaited_once()
 
 
 async def test_learned_scheme_is_saved_and_restored(ble, monkeypatch):
@@ -233,17 +304,6 @@ async def test_garbage_in_the_store_is_ignored(ble, monkeypatch):
     await entity.async_added_to_hass()
 
     assert entity._ble_scheme is None
-
-
-async def test_ble_disconnects_even_when_write_fails(ble):
-    client, *_ = ble
-    client.write_gatt_char.side_effect = OSError("boom")
-    entity = _make_ble_light()
-
-    with pytest.raises(OSError):
-        await entity.async_turn_off()
-
-    client.disconnect.assert_awaited_once()
 
 
 async def test_ble_state_unchanged_when_connect_fails(ble):
@@ -349,6 +409,7 @@ async def test_legacy_encrypted_light_is_detected_and_sealed(ble):
     assert writes[2] == gc._ecb_rc4(key, plain, True) != plain
     assert entity._ble_scheme == "v1"
 
+    await entity._close_ble()
     await entity.async_turn_off()  # known scheme: a fresh handshake on the next connection
     assert len(writes) == 6 and entity._ble_scheme == "v1"
 
@@ -383,6 +444,7 @@ async def test_silent_light_is_cached_as_plain_after_three_misses(ble):
     for _ in range(light.BLE_PLAIN_AFTER_MISSES):
         assert entity._ble_scheme is None
         await entity.async_turn_off()
+        await entity._close_ble()  # each probe needs its own connection
     assert entity._ble_scheme == "plain"
 
     client.read_gatt_char.reset_mock()
@@ -474,13 +536,13 @@ def _frame(*payload):
 
 def test_segment_color_frame_selects_one_segment():
     entity = _make_ble_light()
-    assert entity._build_segment_color_command(0, 255, 0, 0) == _frame(0x15, 0x01, 255, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00)
-    assert entity._build_segment_color_command(9, 0, 0, 255) == _frame(0x15, 0x01, 0, 0, 255, 0, 0, 0, 0, 0, 0x00, 0x02)
+    assert entity._build_segment_color_command(1 << 0, 255, 0, 0) == _frame(0x15, 0x01, 255, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00)
+    assert entity._build_segment_color_command(1 << 9, 0, 0, 255) == _frame(0x15, 0x01, 0, 0, 255, 0, 0, 0, 0, 0, 0x00, 0x02)
 
 
 def test_segment_brightness_frame():
     entity = _make_ble_light()
-    assert entity._build_segment_brightness_command(2, 40) == _frame(0x15, 0x02, 40, 0x04, 0x00)
+    assert entity._build_segment_brightness_command(1 << 2, 40) == _frame(0x15, 0x02, 40, 0x04, 0x00)
 
 
 async def test_ble_segment_writes_through_parent(ble):
@@ -490,12 +552,12 @@ async def test_ble_segment_writes_through_parent(ble):
     parent._write_ble_commands = AsyncMock()
 
     await segment.async_turn_on(**{ATTR_RGB_COLOR: (1, 2, 3)})
-    parent._write_ble_commands.assert_awaited_once_with([parent._build_segment_color_command(1, 1, 2, 3)])
+    parent._write_ble_commands.assert_awaited_once_with([parent._build_segment_color_command(1 << 1, 1, 2, 3)])
     assert segment.is_on and segment.rgb_color == (1, 2, 3)
 
     parent._write_ble_commands.reset_mock()
     await segment.async_turn_off()
-    parent._write_ble_commands.assert_awaited_once_with([parent._build_segment_brightness_command(1, 0)])
+    parent._write_ble_commands.assert_awaited_once_with([parent._build_segment_brightness_command(1 << 1, 0)])
     assert segment.is_on is False
     assert segment.unique_id == f"{parent.unique_id}_segment_1"
     assert segment.device_info == parent.device_info
@@ -523,3 +585,70 @@ async def test_api_segment_still_calls_cloud_api():
 
     await segment.async_turn_off()
     hub.api.set_segment_brightness.assert_awaited_with(DEVICE["sku"], DEVICE["device"], [2], 0)
+
+
+def _segments(parent, count=4):
+    segments = [light.GoveeBLESegmentLight(parent, index) for index in range(count)]
+    for segment in segments:
+        segment.async_write_ha_state = MagicMock()
+    return segments
+
+
+async def test_segments_set_together_share_a_frame_and_a_connection(ble):
+    client, establish, _ = ble
+    parent = _make_ble_light()
+    parent._ble_scheme = "plain"  # no probe writes to count
+    segments = _segments(parent)
+
+    await asyncio.gather(*(s.async_turn_on(**{ATTR_RGB_COLOR: (255, 0, 0)}) for s in segments[:3]))
+
+    assert establish.await_count == 1
+    frames = [call.args[1] for call in client.write_gatt_char.await_args_list]
+    assert frames == [parent._build_segment_color_command(0b111, 255, 0, 0)]
+    assert all(s.is_on for s in segments[:3])
+    await parent._close_ble()
+
+
+async def test_segments_with_different_colours_get_one_frame_each(ble):
+    client, establish, _ = ble
+    parent = _make_ble_light()
+    parent._ble_scheme = "plain"
+    segments = _segments(parent)
+
+    await asyncio.gather(
+        segments[0].async_turn_on(**{ATTR_RGB_COLOR: (255, 0, 0)}),
+        segments[1].async_turn_on(**{ATTR_RGB_COLOR: (0, 0, 255)}),
+        segments[2].async_turn_on(**{ATTR_RGB_COLOR: (255, 0, 0)}),
+    )
+
+    assert establish.await_count == 1
+    frames = [call.args[1] for call in client.write_gatt_char.await_args_list]
+    assert frames == [parent._build_segment_color_command(0b101, 255, 0, 0),
+                      parent._build_segment_color_command(0b010, 0, 0, 255)]
+    await parent._close_ble()
+
+
+async def test_segment_queued_twice_keeps_its_last_colour(ble):
+    client, *_ = ble
+    parent = _make_ble_light()
+    parent._ble_scheme = "plain"
+    segment = _segments(parent, 1)[0]
+
+    await asyncio.gather(segment._send_color(255, 0, 0), segment._send_color(0, 255, 0))
+
+    frames = [call.args[1] for call in client.write_gatt_char.await_args_list]
+    assert frames == [parent._build_segment_color_command(0b1, 0, 255, 0)]
+    await parent._close_ble()
+
+
+async def test_failed_segment_batch_raises_in_every_caller_and_keeps_state(ble):
+    _, establish, _ = ble
+    establish.side_effect = OSError("no link")
+    parent = _make_ble_light()
+    segments = _segments(parent, 2)
+
+    results = await asyncio.gather(
+        *(s.async_turn_on(**{ATTR_RGB_COLOR: (1, 2, 3)}) for s in segments), return_exceptions=True)
+
+    assert all(isinstance(r, ConnectionError) for r in results)
+    assert all(s.is_on is None for s in segments)

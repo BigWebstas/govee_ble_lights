@@ -37,8 +37,11 @@ _LOGGER = logging.getLogger(__name__)
 UUID_CONTROL_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b11'
 UUID_NOTIFY_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b10'
 UUID_ENCRYPTION_VERSION = '00010203-0405-0607-0809-0a0b0c0d2b12'
-# Seconds to wait after the last unacknowledged write before disconnecting.
-BLE_DISCONNECT_DELAY = 0.3
+# Seconds the link is kept open after the last write, so a burst of commands shares one connection
+# (and one key exchange). Writes are unacknowledged, so this also lets the last packets leave.
+BLE_IDLE_HOLD = 10
+# Seconds segment writes are collected before being sent, so segments set together share frames.
+BLE_SEGMENT_BATCH_WINDOW = 0.1
 # Seconds to wait for the reply to a key exchange with a light already known to be encrypted...
 BLE_HANDSHAKE_TIMEOUT = 5
 # ...and for the probe that finds out whether an unknown light is encrypted (real ones answer in ms).
@@ -609,62 +612,128 @@ class GoveeBLEControlMixin:
         return prepareMultiplePacketsData(0xa3, array.array('B', header), array.array('B', scene))
 
     @staticmethod
-    def _segment_mask(index: int) -> list[int]:
-        """Little-endian 2-byte bitmask selecting one segment (bit i = segment i)."""
-        return list((1 << index).to_bytes(2, "little"))
+    def _mask_bytes(mask: int) -> list[int]:
+        """Little-endian 2-byte segment bitmask (bit i = segment i)."""
+        return list(mask.to_bytes(2, "little"))
 
-    def _build_segment_color_command(self, index: int, red: int, green: int, blue: int) -> bytes:
+    def _build_segment_color_command(self, mask: int, red: int, green: int, blue: int) -> bytes:
         return self._prepareSinglePacketData(
             LedCommand.COLOR,
-            [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00, 0x00, 0x00, *self._segment_mask(index)])
+            [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00, 0x00, 0x00, *self._mask_bytes(mask)])
 
-    def _build_segment_brightness_command(self, index: int, percent: int) -> bytes:
+    def _build_segment_brightness_command(self, mask: int, percent: int) -> bytes:
         return self._prepareSinglePacketData(
-            LedCommand.COLOR, [LedMode.SEGMENTS, 0x02, percent, *self._segment_mask(index)])
+            LedCommand.COLOR, [LedMode.SEGMENTS, 0x02, percent, *self._mask_bytes(mask)])
+
+    async def _write_segment(self, kind: str, value, index: int) -> None:
+        """Queue one segment's colour ("color", (r, g, b)) or brightness ("brightness", percent).
+
+        Writes arriving within BLE_SEGMENT_BATCH_WINDOW are merged: segments given the same value
+        share one frame, and all frames go out over one connection. A segment queued twice keeps
+        its last value. Every caller waits for the batch, so each still sees the write's outcome.
+        """
+        bit = 1 << index
+        for key in self._segment_pending:
+            if key[0] == kind:
+                self._segment_pending[key] &= ~bit
+        key = (kind, value)
+        self._segment_pending[key] = self._segment_pending.get(key, 0) | bit
+        if self._segment_flush is None:
+            self._segment_flush = asyncio.ensure_future(self._flush_segments())
+        await asyncio.shield(self._segment_flush)  # one caller giving up must not cancel the batch
+
+    async def _flush_segments(self) -> None:
+        await asyncio.sleep(BLE_SEGMENT_BATCH_WINDOW)
+        pending, self._segment_pending, self._segment_flush = self._segment_pending, {}, None
+        commands = [
+            self._build_segment_color_command(mask, *value) if kind == "color"
+            else self._build_segment_brightness_command(mask, value)
+            for (kind, value), mask in pending.items() if mask
+        ]
+        await self._write_ble_commands(commands)
 
     def _build_ble_off_command(self) -> bytes:
         return self._prepareSinglePacketData(LedCommand.POWER, [0x0])
 
     async def _write_ble_commands(self, commands: list[bytes]) -> None:
-        """Connect and write every command; the link is closed in the background afterwards.
+        """Write every command, connecting first if no link is open; the link then stays open.
 
-        A light accepts one connection at a time and adapters/proxies have few slots, so the
-        link is closed after each batch instead of being held open for the entity's lifetime.
-        The lock stays held until the close finishes, so the caller returns without waiting for it
-        and the next batch still never overlaps the old connection.
+        A light accepts one connection at a time and adapters/proxies have few slots, so the link
+        is closed BLE_IDLE_HOLD seconds after the last write rather than held for the entity's
+        lifetime. If a write on a link kept from an earlier call fails (the light may have dropped
+        it silently), it is retried once on a fresh connection.
         """
-        await self._ble_lock.acquire()
-        handed_off = False
-        try:
+        async with self._ble_lock:
+            self._cancel_idle_close()
+            reused = self._ble_client is not None and self._ble_client.is_connected
+            try:
+                try:
+                    await self._send_on_link(commands)
+                except Exception as err:
+                    if not reused:
+                        raise
+                    _LOGGER.debug("Kept link to %s failed (%s), retrying on a new connection", self.unique_id, err)
+                    await self._drop_link()
+                    await self._send_on_link(commands)
+            except Exception:
+                if self._ble_scheme == BLE_SCHEME_PLAIN:  # the "plain" guess may be wrong: detect again next time
+                    self._ble_probe_misses = 0
+                    self._set_ble_scheme(None)
+                raise
+            self._arm_idle_close()
+
+    async def _send_on_link(self, commands: list[bytes]) -> None:
+        if self._ble_client is None or not self._ble_client.is_connected:
+            await self._drop_link()
             client = await self._connectBluetooth()
             try:
-                session = await self._open_encrypted_session(client)
-                for command in commands:
-                    await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC,
-                                                 session.seal(command) if session else command, False)
+                self._ble_session = await self._open_encrypted_session(client)
             except BaseException:
                 await client.disconnect()
                 raise
-            self._ble_close_task = asyncio.create_task(self._close_ble(client))
-            handed_off = True
-        except Exception:
-            if self._ble_scheme == BLE_SCHEME_PLAIN:  # the "plain" guess may be wrong: detect again next time
-                self._ble_probe_misses = 0
-                self._set_ble_scheme(None)
-            raise
-        finally:
-            if not handed_off:
-                self._ble_lock.release()
-
-    async def _close_ble(self, client: BleakClient) -> None:
-        """Let the last packets leave (writes are unacknowledged), hang up, then free the lock."""
+            self._ble_client = client
         try:
-            await asyncio.sleep(BLE_DISCONNECT_DELAY)
-            await client.disconnect()
-        except Exception as err:
-            _LOGGER.debug("Disconnecting %s failed: %s", self.unique_id, err)
-        finally:
-            self._ble_lock.release()
+            for command in commands:
+                await self._ble_client.write_gatt_char(
+                    UUID_CONTROL_CHARACTERISTIC,
+                    self._ble_session.seal(command) if self._ble_session else command, False)
+        except BaseException:
+            await self._drop_link()
+            raise
+
+    async def _drop_link(self) -> None:
+        """Forget and hang up the open link, if any. Call with the lock held."""
+        client, self._ble_client, self._ble_session = self._ble_client, None, None
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception as err:
+                _LOGGER.debug("Disconnecting %s failed: %s", self.unique_id, err)
+
+    def _arm_idle_close(self) -> None:
+        self._ble_idle_handle = asyncio.get_running_loop().call_later(BLE_IDLE_HOLD, self._start_idle_close)
+
+    def _cancel_idle_close(self) -> None:
+        if self._ble_idle_handle is not None:
+            self._ble_idle_handle.cancel()
+            self._ble_idle_handle = None
+
+    def _start_idle_close(self) -> None:
+        self._ble_idle_handle = None
+        self._ble_close_task = asyncio.create_task(self._close_idle_link())
+
+    async def _close_idle_link(self) -> None:
+        async with self._ble_lock:
+            if self._ble_idle_handle is None:  # nothing wrote while this waited for the lock
+                await self._drop_link()
+
+    async def _close_ble(self) -> None:
+        """Hang up now (entity removal), waiting out any close already under way."""
+        self._cancel_idle_close()
+        if self._ble_close_task is not None:
+            await self._ble_close_task
+        async with self._ble_lock:
+            await self._drop_link()
 
     def _set_ble_scheme(self, scheme: str | None) -> None:
         """Change the remembered scheme and persist it, so a restart does not re-learn it."""
@@ -729,14 +798,11 @@ class GoveeBLEControlMixin:
         ble_device = bluetooth.async_ble_device_from_address(self.hass, self._mac.upper(), True) or self._ble_device
         if ble_device is None:
             raise ConnectionError(f"No Bluetooth device found for {self.unique_id}")
-        last_error: Exception | None = None
-        for _ in range(3):
-            try:
-                return await bleak_retry_connector.establish_connection(BleakClient, ble_device, self.unique_id)
-            except Exception as ex:
-                last_error = ex
-                continue
-        raise ConnectionError(f"Could not connect to {self.unique_id} after 3 attempts") from last_error
+        try:
+            # establish_connection already retries internally; no extra loop on top of it.
+            return await bleak_retry_connector.establish_connection(BleakClient, ble_device, self.unique_id)
+        except Exception as err:
+            raise ConnectionError(f"Could not connect to {self.unique_id}") from err
 
     def _prepareSinglePacketData(self, cmd, payload):
         if not isinstance(cmd, int):
@@ -778,7 +844,12 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
         self._ble_lock = asyncio.Lock()
         self._ble_scheme: str | None = None  # BLE_SCHEME_*, learned from the first successful handshake
         self._ble_probe_misses = 0
+        self._ble_client: BleakClient | None = None
+        self._ble_session = None
+        self._ble_idle_handle: asyncio.TimerHandle | None = None
         self._ble_close_task: asyncio.Task | None = None
+        self._segment_pending: dict[tuple, int] = {}
+        self._segment_flush: asyncio.Future | None = None
         self._scheme_store: Store | None = None
         self._state = None
         self._brightness = None
@@ -791,8 +862,7 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
             self._ble_scheme = saved["scheme"]
 
     async def async_will_remove_from_hass(self) -> None:
-        if self._ble_close_task is not None:
-            await self._ble_close_task  # never abandon a link half-closed
+        await self._close_ble()  # never abandon an open link
         await super().async_will_remove_from_hass()
 
     @property
@@ -863,10 +933,10 @@ class GoveeBLESegmentLight(_SegmentLight):
         return self._parent.device_info
 
     async def _send_color(self, red: int, green: int, blue: int) -> None:
-        await self._parent._write_ble_commands([self._parent._build_segment_color_command(self._index, red, green, blue)])
+        await self._parent._write_segment("color", (red, green, blue), self._index)
 
     async def _send_brightness(self, percent: int) -> None:
-        await self._parent._write_ble_commands([self._parent._build_segment_brightness_command(self._index, percent)])
+        await self._parent._write_segment("brightness", percent, self._index)
 
 
 class GoveeHybridLight(CoordinatorEntity, LightEntity):
