@@ -54,6 +54,9 @@ BLE_SCHEME_SAVE_DELAY = 1
 # [0x02] + payload (confirmed for H70B1 from a Govee Home app capture).
 PICTURE_SCENE_MODELS = ['H70B1']
 
+# Segments per BLE model when it differs from the 15 the segment bitmask addresses.
+BLE_SEGMENT_COUNTS: dict[str, int] = {}
+BLE_DEFAULT_SEGMENTS = 15
 SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199', 'H70B1', 'H6095', 'H7092', 'H619D']
 
 class LedCommand(IntEnum):
@@ -161,7 +164,12 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
         ble_device = bluetooth.async_ble_device_from_address(hass, hub.address.upper(), False)
         # Parse the scene catalog in the executor: the entity reads it on every state write.
         await hass.async_add_executor_job(_read_catalog, config_entry.data["model"])
-        async_add_entities([GoveeBluetoothLight(hub, ble_device, config_entry)])
+        ble_light = GoveeBluetoothLight(hub, ble_device, config_entry)
+        entities = [ble_light]
+        if ble_light._is_segmented:
+            count = BLE_SEGMENT_COUNTS.get(ble_light._model, BLE_DEFAULT_SEGMENTS)
+            entities += [GoveeBLESegmentLight(ble_light, index) for index in range(count)]
+        async_add_entities(entities)
     elif hub.lan_controller is not None:
         async_add_entities([GoveeLANLight(device) for device in hub.lan_controller.devices])
 
@@ -321,11 +329,12 @@ class GoveeAPILight(CoordinatorEntity, LightEntity):
         self._state = False
 
 
-class GoveeAPISegmentLight(LightEntity):
-    """One controllable segment of a Govee light, driven through the cloud API.
+class _SegmentLight(LightEntity):
+    """One controllable segment of a Govee light.
 
-    The Govee API exposes no per-segment power or state read-back, so on/off is
-    emulated with segmented brightness and the state here is optimistic.
+    Neither the cloud API nor BLE offers per-segment power or state read-back, so
+    on/off is emulated with segmented brightness and the state here is optimistic.
+    Subclasses supply the transport via `_send_color` and `_send_brightness`.
     """
 
     _attr_color_mode = ColorMode.RGB
@@ -333,28 +342,20 @@ class GoveeAPISegmentLight(LightEntity):
     _attr_has_entity_name = True
     _attr_should_poll = False
 
-    def __init__(self, hub: Hub, device: dict, index: int) -> None:
-        self.hub = hub
-        self.device_data = device
-        self.sku = device["sku"]
-        self.device = device["device"]
+    def __init__(self, index: int, unique_id: str) -> None:
         self._index = index
-
         self._attr_name = f"Segment {index + 1}"
-        self._attr_unique_id = f"{self.device}_segment_{index}"
+        self._attr_unique_id = unique_id
 
         self._state = None
         self._brightness = 255
         self._attr_rgb_color = (255, 255, 255)
 
-    @property
-    def device_info(self) -> dict:
-        return {
-            "identifiers": {(DOMAIN, self.device)},
-            "name": self.device_data["deviceName"],
-            "manufacturer": "Govee",
-            "model": self.sku,
-        }
+    async def _send_color(self, red: int, green: int, blue: int) -> None:
+        raise NotImplementedError
+
+    async def _send_brightness(self, percent: int) -> None:
+        raise NotImplementedError
 
     @property
     def is_on(self) -> bool | None:
@@ -365,30 +366,53 @@ class GoveeAPISegmentLight(LightEntity):
         return self._brightness
 
     async def async_turn_on(self, **kwargs) -> None:
-        segments = [self._index]
-
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs[ATTR_RGB_COLOR]
-            await self.hub.api.set_segment_rgb(self.sku, self.device, segments, red, green, blue)
+            await self._send_color(red, green, blue)
             self._attr_rgb_color = (red, green, blue)
 
         if ATTR_BRIGHTNESS in kwargs:
             brightness = kwargs[ATTR_BRIGHTNESS]
-            await self.hub.api.set_segment_brightness(self.sku, self.device, segments,
-                                                      round(brightness / 255 * 100))
+            await self._send_brightness(round(brightness / 255 * 100))
             self._brightness = brightness
         elif ATTR_RGB_COLOR not in kwargs:
             # Plain toggle on: re-assert the last colour so the segment lights up.
             red, green, blue = self._attr_rgb_color
-            await self.hub.api.set_segment_rgb(self.sku, self.device, segments, red, green, blue)
+            await self._send_color(red, green, blue)
 
         self._state = True
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self.hub.api.set_segment_brightness(self.sku, self.device, [self._index], 0)
+        await self._send_brightness(0)
         self._state = False
         self.async_write_ha_state()
+
+
+class GoveeAPISegmentLight(_SegmentLight):
+    """One segment of a Govee light, driven through the cloud API."""
+
+    def __init__(self, hub: Hub, device: dict, index: int) -> None:
+        super().__init__(index, f"{device['device']}_segment_{index}")
+        self.hub = hub
+        self.device_data = device
+        self.sku = device["sku"]
+        self.device = device["device"]
+
+    @property
+    def device_info(self) -> dict:
+        return {
+            "identifiers": {(DOMAIN, self.device)},
+            "name": self.device_data["deviceName"],
+            "manufacturer": "Govee",
+            "model": self.sku,
+        }
+
+    async def _send_color(self, red: int, green: int, blue: int) -> None:
+        await self.hub.api.set_segment_rgb(self.sku, self.device, [self._index], red, green, blue)
+
+    async def _send_brightness(self, percent: int) -> None:
+        await self.hub.api.set_segment_brightness(self.sku, self.device, [self._index], percent)
 
 
 class GoveeLANLight(LightEntity):
@@ -583,6 +607,20 @@ class GoveeBLEControlMixin:
         else:
             header = [0x02]
         return prepareMultiplePacketsData(0xa3, array.array('B', header), array.array('B', scene))
+
+    @staticmethod
+    def _segment_mask(index: int) -> list[int]:
+        """Little-endian 2-byte bitmask selecting one segment (bit i = segment i)."""
+        return list((1 << index).to_bytes(2, "little"))
+
+    def _build_segment_color_command(self, index: int, red: int, green: int, blue: int) -> bytes:
+        return self._prepareSinglePacketData(
+            LedCommand.COLOR,
+            [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00, 0x00, 0x00, *self._segment_mask(index)])
+
+    def _build_segment_brightness_command(self, index: int, percent: int) -> bytes:
+        return self._prepareSinglePacketData(
+            LedCommand.COLOR, [LedMode.SEGMENTS, 0x02, percent, *self._segment_mask(index)])
 
     def _build_ble_off_command(self) -> bytes:
         return self._prepareSinglePacketData(LedCommand.POWER, [0x0])
@@ -807,6 +845,28 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
         await self._write_ble_commands([self._build_ble_off_command()])
         self._state = False
         self.async_write_ha_state()
+
+
+class GoveeBLESegmentLight(_SegmentLight):
+    """One segment of a BLE light.
+
+    Writes go through the parent light so they share its single connection,
+    encryption session and lock; a segment never connects on its own.
+    """
+
+    def __init__(self, parent: GoveeBluetoothLight, index: int) -> None:
+        super().__init__(index, f"{parent.unique_id}_segment_{index}")
+        self._parent = parent
+
+    @property
+    def device_info(self) -> dict:
+        return self._parent.device_info
+
+    async def _send_color(self, red: int, green: int, blue: int) -> None:
+        await self._parent._write_ble_commands([self._parent._build_segment_color_command(self._index, red, green, blue)])
+
+    async def _send_brightness(self, percent: int) -> None:
+        await self._parent._write_ble_commands([self._parent._build_segment_brightness_command(self._index, percent)])
 
 
 class GoveeHybridLight(CoordinatorEntity, LightEntity):

@@ -462,3 +462,64 @@ def test_scene_catalog_is_parsed_once_and_effect_list_is_memoised():
         assert entity.effect_list == first
 
     assert light._read_catalog.cache_info().misses == 1
+
+
+def _frame(*payload):
+    frame = bytes([0x33, 0x05, *payload]).ljust(19, b"\0")
+    checksum = 0
+    for b in frame:
+        checksum ^= b
+    return frame + bytes([checksum])
+
+
+def test_segment_color_frame_selects_one_segment():
+    entity = _make_ble_light()
+    assert entity._build_segment_color_command(0, 255, 0, 0) == _frame(0x15, 0x01, 255, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00)
+    assert entity._build_segment_color_command(9, 0, 0, 255) == _frame(0x15, 0x01, 0, 0, 255, 0, 0, 0, 0, 0, 0x00, 0x02)
+
+
+def test_segment_brightness_frame():
+    entity = _make_ble_light()
+    assert entity._build_segment_brightness_command(2, 40) == _frame(0x15, 0x02, 40, 0x04, 0x00)
+
+
+async def test_ble_segment_writes_through_parent(ble):
+    parent = _make_ble_light()
+    segment = light.GoveeBLESegmentLight(parent, 1)
+    segment.async_write_ha_state = MagicMock()
+    parent._write_ble_commands = AsyncMock()
+
+    await segment.async_turn_on(**{ATTR_RGB_COLOR: (1, 2, 3)})
+    parent._write_ble_commands.assert_awaited_once_with([parent._build_segment_color_command(1, 1, 2, 3)])
+    assert segment.is_on and segment.rgb_color == (1, 2, 3)
+
+    parent._write_ble_commands.reset_mock()
+    await segment.async_turn_off()
+    parent._write_ble_commands.assert_awaited_once_with([parent._build_segment_brightness_command(1, 0)])
+    assert segment.is_on is False
+    assert segment.unique_id == f"{parent.unique_id}_segment_1"
+    assert segment.device_info == parent.device_info
+
+
+async def test_setup_adds_segments_only_for_segmented_ble_models(monkeypatch):
+    for model, expected in (("H70B1", 1 + 15), ("H705A", 1)):
+        hub = MagicMock(address="AA:BB:CC:DD:EE:FF", devices=None)
+        entry = MagicMock(entry_id="e", data={"model": model})
+        hass = MagicMock(data={light.DOMAIN: {"e": hub}}, async_add_executor_job=AsyncMock())
+        monkeypatch.setattr(light.bluetooth, "async_ble_device_from_address", MagicMock())
+        add = MagicMock()
+        await light.async_setup_entry(hass, entry, add)
+        assert len(add.call_args.args[0]) == expected
+
+
+async def test_api_segment_still_calls_cloud_api():
+    hub = MagicMock(api=MagicMock(set_segment_rgb=AsyncMock(), set_segment_brightness=AsyncMock()))
+    segment = light.GoveeAPISegmentLight(hub, {**DEVICE, "deviceName": "Strip"}, 2)
+    segment.async_write_ha_state = MagicMock()
+
+    await segment.async_turn_on(**{ATTR_RGB_COLOR: (9, 8, 7), "brightness": 255})
+    hub.api.set_segment_rgb.assert_awaited_once_with(DEVICE["sku"], DEVICE["device"], [2], 9, 8, 7)
+    hub.api.set_segment_brightness.assert_awaited_once_with(DEVICE["sku"], DEVICE["device"], [2], 100)
+
+    await segment.async_turn_off()
+    hub.api.set_segment_brightness.assert_awaited_with(DEVICE["sku"], DEVICE["device"], [2], 0)
