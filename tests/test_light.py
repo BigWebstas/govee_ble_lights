@@ -500,7 +500,7 @@ async def test_plain_cache_is_dropped_when_the_connection_fails(ble):
     entity._ble_scheme, entity._ble_probe_misses = "plain", 3
 
     with pytest.raises(ConnectionError):
-        await entity.async_turn_off()
+        await entity.async_turn_on()
 
     assert entity._ble_scheme is None and entity._ble_probe_misses == 0
 
@@ -652,3 +652,46 @@ async def test_failed_segment_batch_raises_in_every_caller_and_keeps_state(ble):
 
     assert all(isinstance(r, ConnectionError) for r in results)
     assert all(s.is_on is None for s in segments)
+
+
+async def test_turn_off_that_cannot_connect_is_retried_once_later(ble, monkeypatch):
+    client, establish, _ = ble
+    monkeypatch.setattr(light, "BLE_OFF_RETRY_DELAY", 0.01)
+    establish.side_effect = [OSError("no link"), client]
+    entity = _make_ble_light()
+
+    await entity.async_turn_off()  # swallowed: no error reaches the caller
+    assert entity.is_on is None
+
+    await asyncio.sleep(0.1)
+    assert entity.is_on is False
+    assert establish.await_count == 2
+    await entity._close_ble()
+
+
+async def test_failed_off_retry_gives_up_quietly(ble, monkeypatch):
+    _, establish, _ = ble
+    monkeypatch.setattr(light, "BLE_OFF_RETRY_DELAY", 0.01)
+    establish.side_effect = OSError("no link")
+    entity = _make_ble_light()
+
+    await entity.async_turn_off()
+    await asyncio.sleep(0.1)
+
+    assert establish.await_count == 2
+    assert entity.is_on is None
+
+
+async def test_turn_on_cancels_a_pending_off_retry(ble, monkeypatch):
+    client, establish, _ = ble
+    monkeypatch.setattr(light, "BLE_OFF_RETRY_DELAY", 0.05)
+    establish.side_effect = [OSError("no link"), client]
+    entity = _make_ble_light()
+
+    await entity.async_turn_off()
+    await entity.async_turn_on()
+    await asyncio.sleep(0.15)
+
+    assert entity.is_on is True
+    assert establish.await_count == 2
+    await entity._close_ble()
