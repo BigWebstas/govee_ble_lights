@@ -40,6 +40,7 @@ UUID_ENCRYPTION_VERSION = '00010203-0405-0607-0809-0a0b0c0d2b12'
 # Seconds the link is kept open after the last write, so a burst of commands shares one connection
 # (and one key exchange). Writes are unacknowledged, so this also lets the last packets leave.
 BLE_IDLE_HOLD = 10
+BLE_OFF_RETRY_DELAY = 30  # seconds before the one retry of a turn-off that could not connect
 # Seconds segment writes are collected before being sent, so segments set together share frames.
 BLE_SEGMENT_BATCH_WINDOW = 0.1
 # Seconds to wait for the reply to a key exchange with a light already known to be encrypted...
@@ -848,6 +849,8 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
         self._ble_session = None
         self._ble_idle_handle: asyncio.TimerHandle | None = None
         self._ble_close_task: asyncio.Task | None = None
+        self._off_retry_handle: asyncio.TimerHandle | None = None
+        self._off_retry_task: asyncio.Task | None = None
         self._segment_pending: dict[tuple, int] = {}
         self._segment_flush: asyncio.Future | None = None
         self._scheme_store: Store | None = None
@@ -862,6 +865,7 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
             self._ble_scheme = saved["scheme"]
 
     async def async_will_remove_from_hass(self) -> None:
+        self._cancel_off_retry()
         await self._close_ble()  # never abandon an open link
         await super().async_will_remove_from_hass()
 
@@ -898,6 +902,7 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
         return self._local_ble_effect_list()
 
     async def async_turn_on(self, **kwargs) -> None:
+        self._cancel_off_retry()  # a queued turn-off must not undo this
         await self._write_ble_commands(self._build_ble_on_commands(**kwargs))
 
         # BLE has no state read-back, so state is tracked optimistically, but only once the
@@ -912,9 +917,38 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._write_ble_commands([self._build_ble_off_command()])
+        self._cancel_off_retry()
+        try:
+            await self._write_ble_commands([self._build_ble_off_command()])
+        except ConnectionError as err:
+            # Turning off is routine and idempotent, so an unreachable light gets one later retry
+            # instead of failing every script that switches off a group containing it.
+            _LOGGER.warning("Could not turn off %s (%s), retrying in %s s", self.unique_id, err, BLE_OFF_RETRY_DELAY)
+            self._off_retry_handle = asyncio.get_running_loop().call_later(BLE_OFF_RETRY_DELAY, self._start_off_retry)
+            return
         self._state = False
         self.async_write_ha_state()
+
+    def _start_off_retry(self) -> None:
+        self._off_retry_handle = None
+        self._off_retry_task = asyncio.create_task(self._retry_off())
+
+    async def _retry_off(self) -> None:
+        try:
+            await self._write_ble_commands([self._build_ble_off_command()])
+        except ConnectionError as err:
+            _LOGGER.warning("Gave up turning off %s: %s", self.unique_id, err)
+            return
+        self._state = False
+        self.async_write_ha_state()
+
+    def _cancel_off_retry(self) -> None:
+        if self._off_retry_handle is not None:
+            self._off_retry_handle.cancel()
+            self._off_retry_handle = None
+        if self._off_retry_task is not None:
+            self._off_retry_task.cancel()
+            self._off_retry_task = None
 
 
 class GoveeBLESegmentLight(_SegmentLight):
