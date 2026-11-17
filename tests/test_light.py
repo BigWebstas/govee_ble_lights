@@ -695,3 +695,21 @@ async def test_turn_on_cancels_a_pending_off_retry(ble, monkeypatch):
     assert entity.is_on is True
     assert establish.await_count == 2
     await entity._close_ble()
+
+
+def test_h6095_scene_matches_govee_app_capture():
+    # Aurora as captured from the Govee Home app over BLE (decrypted v1 frames, 2026-11-17).
+    light_ = object.__new__(GoveeBLEControlMixin)
+    light_._model = "H6095"
+    catalog = _Catalog("H6095")
+    scene = base64.b64decode(catalog._resolve_effect_param(*catalog._effect_map()["Aurora"]))
+
+    packets = [bytes(p).hex() for p in light_._build_scene_packets(scene)]
+
+    assert packets == [
+        "a30001035822000001001d0001000000137f00aa",
+        "a30103006400030000ff00ffff6d62ff32000af1",
+        "a3ff0a641e1e1e0000000000000000000000002c",
+    ]
+    # The app then activates it with the catalog sceneCode (19516 = 0x4c3c); the app's extra byte (02 for Aurora) is not understood, so we send 00.
+    assert light_._build_scene_activate_command(19516)[:6].hex() == "3305043c4c00"

@@ -57,6 +57,13 @@ BLE_SCHEME_SAVE_DELAY = 1
 # Models whose scene upload is framed as [0x0c, type + 0x3b] + payload[1:] instead of
 # [0x02] + payload (confirmed for H70B1 from a Govee Home app capture).
 PICTURE_SCENE_MODELS = ['H70B1']
+# Models that upload a scene as plain `a3` packets (no 02 header) with the payload's first byte
+# raised by this offset, then switch to it with `33 05 04 <sceneCode lo> <hi> <extra>`
+# (confirmed for H6095 from a Govee Home app capture, 2026-11-17).
+ACTIVATED_SCENE_MODELS: dict[str, int] = {'H6095': 8}
+# Seconds to let a light ack a scene upload before the activation frame follows (the app waits
+# for the ack, which arrives within ~0.2 s).
+BLE_SCENE_ACTIVATE_DELAY = 0.25
 
 # Segments per BLE model when it differs from the 15 the segment bitmask addresses.
 BLE_SEGMENT_COUNTS: dict[str, int] = {}
@@ -601,12 +608,27 @@ class GoveeBLEControlMixin:
                                                          specialEffectIndex)
 
                 commands.extend(self._build_scene_packets(base64.b64decode(scene_param)))
+                if self._model in ACTIVATED_SCENE_MODELS:
+                    scene_code = self._resolve_effect_code(categoryIndex, sceneIndex, lightEffectIndex)
+                    commands.append(BLE_SCENE_ACTIVATE_DELAY)  # let the light ack the upload first
+                    commands.append(self._build_scene_activate_command(scene_code))
 
         return commands
 
+    def _resolve_effect_code(self, categoryIdx: int, sceneIdx: int, leffectIdx: int) -> int:
+        lightEffect = self._load_effects_json()['data']['categories'][categoryIdx]['scenes'][sceneIdx]['lightEffects'][
+            leffectIdx]
+        return int(lightEffect['sceneCode'])
+
+    def _build_scene_activate_command(self, scene_code: int) -> bytes:
+        """`33 05 04 <code lo> <code hi> <extra>`; the app's per-scene extra byte is not understood, so 0."""
+        return self._prepareSinglePacketData(LedCommand.COLOR, [0x04, *scene_code.to_bytes(2, "little"), 0x00])
+
     def _build_scene_packets(self, scene: bytes) -> list:
         """Split a catalog scene payload into the chunked 0xa3 packets the light expects."""
-        if self._model in PICTURE_SCENE_MODELS:
+        if self._model in ACTIVATED_SCENE_MODELS:
+            header, scene = [], bytes([(scene[0] + ACTIVATED_SCENE_MODELS[self._model]) & 0xFF]) + scene[1:]
+        elif self._model in PICTURE_SCENE_MODELS:
             header, scene = [], bytes([0x0c, scene[0] + 0x3b]) + scene[1:]
         else:
             header = [0x02]
@@ -695,6 +717,9 @@ class GoveeBLEControlMixin:
             self._ble_client = client
         try:
             for command in commands:
+                if isinstance(command, float):  # a pause between frames, not a frame
+                    await asyncio.sleep(command)
+                    continue
                 await self._ble_client.write_gatt_char(
                     UUID_CONTROL_CHARACTERISTIC,
                     self._ble_session.seal(command) if self._ble_session else command, False)
