@@ -1071,3 +1071,13 @@ async def test_h6095_scene_activation_proceeds_immediately_on_a3_ack(ble, monkey
 
     assert elapsed < 1.0  # returned immediately on the 0xA3 ack rather than waiting 5s
     await entity._close_ble()
+
+
+def test_all_available_ble_models_load_from_compressed_catalog():
+    from custom_components.govee_ble_lights.config_flow import _AVAILABLE_MODELS
+
+    assert len(_AVAILABLE_MODELS) == 81
+    assert {"H6095", "H3501", "H7093", "H70B1", "H6199", "H6102"} <= set(_AVAILABLE_MODELS)
+    for model in _AVAILABLE_MODELS:
+        catalog = light._read_catalog(model)
+        assert catalog["data"]["categories"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import array
 import asyncio
+import gzip
 import logging
 from functools import lru_cache
 from typing import NamedTuple
@@ -514,10 +515,26 @@ class GoveeLANLight(LightEntity):
         await self._device.turn_off()
 
 
+_JSONS_DIR = Path(__file__).parent / "jsons"
+
+
+@lru_cache(maxsize=1)
+def _catalog_aliases() -> dict[str, str]:
+    """Map models whose scene catalog is identical to another shipped model."""
+    aliases_path = _JSONS_DIR / "aliases.json"
+    if not aliases_path.is_file():
+        return {}
+    return json.loads(aliases_path.read_text())
+
+
 @lru_cache(maxsize=None)
 def _read_catalog(model: str) -> dict:
     """Parse a model's scene catalog once; callers must treat the result as read-only."""
-    return json.loads((Path(__file__).parent / "jsons" / f"{model}.json").read_text())
+    canonical = _catalog_aliases().get(model, model)
+    gz_path = _JSONS_DIR / f"{canonical}.json.gz"
+    if gz_path.is_file():
+        return json.loads(gzip.decompress(gz_path.read_bytes()))
+    return json.loads((_JSONS_DIR / f"{canonical}.json").read_text())
 
 
 class GoveeBLEControlMixin:

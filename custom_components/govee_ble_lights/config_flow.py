@@ -18,9 +18,25 @@ from govee_local_api import GoveeController
 from .const import DOMAIN, CONF_TYPE_API, CONF_TYPE_BLE, CONF_TYPE_LAN, CONF_FINGERPRINT
 from pathlib import Path
 import asyncio
+import json
+
+
+def _load_available_models() -> list[str]:
+    jsons_dir = Path(__file__).parent / "jsons"
+    aliases_file = jsons_dir / "aliases.json"
+    models = set(json.loads(aliases_file.read_text())) if aliases_file.is_file() else set()
+    for file in jsons_dir.iterdir():
+        if file.name == "aliases.json":
+            continue
+        if file.name.endswith(".json.gz"):
+            models.add(file.name[:-8])
+        elif file.suffix == ".json":
+            models.add(file.stem)
+    return sorted(models)
+
 
 # Scanned at import time (HA imports integrations off the event loop), not on every flow start.
-_AVAILABLE_MODELS = sorted(file.stem for file in (Path(__file__).parent / "jsons").iterdir())
+_AVAILABLE_MODELS = _load_available_models()
 
 
 class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
