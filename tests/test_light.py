@@ -144,18 +144,23 @@ def test_h70b1_scene_matches_govee_app_capture():
     ]
 
 
+_BLE_ENTITIES: list[light.GoveeBluetoothLight] = []
+
+
 def _make_ble_light():
     hub = MagicMock(address="AA:BB:CC:DD:EE:FF")
     entry = MagicMock(data={"model": "H705A"})
     entity = light.GoveeBluetoothLight(hub, "cached-device", entry)
     entity.hass = MagicMock()
     entity.async_write_ha_state = MagicMock()
+    _BLE_ENTITIES.append(entity)
     return entity
 
 
 @pytest.fixture
 def ble(monkeypatch):
     """Patch the Bluetooth stack; return (client, establish_connection mock, device lookup mock)."""
+    _BLE_ENTITIES.clear()
     client = MagicMock(is_connected=True, write_gatt_char=AsyncMock(), disconnect=AsyncMock(),
                        read_gatt_char=AsyncMock(side_effect=BleakCharacteristicNotFoundError("2b12")),
                        start_notify=AsyncMock())
@@ -166,7 +171,15 @@ def ble(monkeypatch):
     monkeypatch.setattr(light, "BLE_IDLE_HOLD", 60)  # tests that want the idle close shorten it
     monkeypatch.setattr(light, "BLE_SEGMENT_BATCH_WINDOW", 0.01)
     monkeypatch.setattr(light, "BLE_PROBE_TIMEOUT", 0.01)
-    return client, establish, lookup
+    monkeypatch.setattr(light, "BLE_VERIFY_DELAY", 0)
+    monkeypatch.setattr(light, "BLE_VERIFY_TIMEOUT", 0.01)
+    monkeypatch.setattr(light, "BLE_V1_CONFIRM_DELAY", 0)
+    yield client, establish, lookup
+    for entity in _BLE_ENTITIES:
+        entity._cancel_on_retry()
+        entity._cancel_off_retry()
+        entity._cancel_idle_close()
+    _BLE_ENTITIES.clear()
 
 
 async def test_ble_write_uses_fresh_device_and_keeps_link_open(ble):
@@ -176,8 +189,10 @@ async def test_ble_write_uses_fresh_device_and_keeps_link_open(ble):
     await entity.async_turn_off()
 
     lookup.assert_called_once_with(entity.hass, "AA:BB:CC:DD:EE:FF", True)
+    assert establish.call_args.args[0] is light.BleakClientWithServiceCache
     assert establish.call_args.args[1] == "fresh-device"
-    assert client.write_gatt_char.await_count == 2  # v1 probe (unanswered), then the plain command
+    assert establish.call_args.kwargs["disconnected_callback"] == entity._on_ble_disconnected
+    assert client.write_gatt_char.await_count == 3  # v1 probe (unanswered), plain off, aa 01 query
     client.disconnect.assert_not_awaited()  # held open for the next command
     assert entity.is_on is False
     await entity._close_ble()
@@ -192,7 +207,7 @@ async def test_burst_of_commands_shares_one_connection(ble):
     await entity.async_turn_on()
 
     assert establish.await_count == 1
-    assert client.write_gatt_char.await_count == 3  # one probe, then a command per call
+    assert client.write_gatt_char.await_count == 5  # probe, off + aa01, on + aa01
     await entity._close_ble()
 
 
@@ -242,7 +257,7 @@ async def test_failed_write_on_kept_link_retries_once_on_fresh_link(ble):
     entity._ble_scheme = "plain"
     await entity.async_turn_off()  # link now kept
 
-    client.write_gatt_char.side_effect = [OSError("stale link"), None]
+    client.write_gatt_char.side_effect = [OSError("stale link"), None, None]
     await entity.async_turn_on()
 
     assert establish.await_count == 2
@@ -356,7 +371,8 @@ async def test_encrypted_light_gets_handshake_then_sealed_frames(ble):
 
     plain = entity._build_ble_off_command()
     assert writes[0][:3] == bytes([0xE7, 0x11, 0x01])
-    assert len(writes) == 2 and writes[1] != plain and len(writes[1]) == 4 + 20 + gc.TAG_LEN
+    assert len(writes) == 3 and writes[1] != plain and len(writes[1]) == 4 + 20 + gc.TAG_LEN
+    assert len(writes[2]) == 4 + 20 + gc.TAG_LEN  # sealed aa 01 power query
     assert entity.is_on is False
 
 
@@ -395,7 +411,7 @@ async def test_legacy_encrypted_light_is_detected_and_sealed(ble):
 
     async def write(_uuid, data, _response):
         writes.append(bytes(data))
-        if len(writes) % 3 == 1:  # round 1 of each connection: the light answers with its session key
+        if len(writes) % 4 == 1:  # round 1 of each connection: the light answers with its session key
             captured["notify"](None, _legacy_light_reply(bytes(data), key))
 
     client.start_notify = start_notify
@@ -405,13 +421,13 @@ async def test_legacy_encrypted_light_is_detected_and_sealed(ble):
     await entity.async_turn_off()
 
     plain = entity._build_ble_off_command()
-    assert len(writes) == 3  # request, confirm, command
+    assert len(writes) == 4  # request, confirm, command, aa 01 query
     assert writes[2] == gc._ecb_rc4(key, plain, True) != plain
     assert entity._ble_scheme == "v1"
 
     await entity._close_ble()
     await entity.async_turn_off()  # known scheme: a fresh handshake on the next connection
-    assert len(writes) == 6 and entity._ble_scheme == "v1"
+    assert len(writes) == 8 and entity._ble_scheme == "v1"
 
 
 async def test_silent_light_gets_plain_frames_and_is_not_pinned(ble):
@@ -421,7 +437,8 @@ async def test_silent_light_gets_plain_frames_and_is_not_pinned(ble):
     await entity.async_turn_off()
 
     plain = entity._build_ble_off_command()
-    assert client.write_gatt_char.await_args_list[-1].args[1] == plain
+    assert client.write_gatt_char.await_args_list[-2].args[1] == plain
+    assert client.write_gatt_char.await_args_list[-1].args[1] == entity._prepareQueryPacketData(light.LedCommand.POWER)
     assert entity._ble_scheme is None
 
 
@@ -453,9 +470,8 @@ async def test_silent_light_is_cached_as_plain_after_three_misses(ble):
     await entity.async_turn_off()
 
     client.read_gatt_char.assert_not_awaited()
-    client.start_notify.assert_not_awaited()
-    client.write_gatt_char.assert_awaited_once()
-    assert client.write_gatt_char.await_args.args[1] == entity._build_ble_off_command()
+    frames = [call.args[1] for call in client.write_gatt_char.await_args_list]
+    assert frames == [entity._build_ble_off_command(), entity._prepareQueryPacketData(light.LedCommand.POWER)]
 
 
 async def test_positive_detection_resets_the_miss_counter(ble):
@@ -713,3 +729,345 @@ def test_h6095_scene_matches_govee_app_capture():
     ]
     # The app then activates it with the catalog sceneCode (19516 = 0x4c3c); the app's extra byte (02 for Aurora) is not understood, so we send 00.
     assert light_._build_scene_activate_command(19516)[:6].hex() == "3305043c4c00"
+
+
+def _status_frame(is_on: bool) -> bytes:
+    body = bytes([0xAA, 0x01, 0x01 if is_on else 0x00]).ljust(19, b"\0")
+    checksum = 0
+    for b in body:
+        checksum ^= b
+    return body + bytes([checksum])
+
+
+async def test_turn_on_retries_when_light_reports_off_then_succeeds(ble):
+    client, establish, _ = ble
+    entity = _make_ble_light()
+    entity._ble_scheme = "plain"
+    replies = iter([_status_frame(False), _status_frame(True)])
+    captured = {}
+    writes = []
+
+    async def start_notify(_uuid, callback):
+        captured["notify"] = callback
+
+    async def write(_uuid, data, _response):
+        frame = bytes(data)
+        writes.append(frame)
+        if frame[:2] == bytes([0xAA, 0x01]):
+            captured["notify"](None, next(replies))
+
+    client.start_notify = start_notify
+    client.write_gatt_char = write
+
+    await entity.async_turn_on()
+
+    power_on = entity._prepareSinglePacketData(light.LedCommand.POWER, [0x01])
+    assert writes.count(power_on) == 2
+    assert establish.await_count == 1
+    assert entity.is_on is True
+    assert entity._ble_supports_status is True
+    await entity._close_ble()
+
+
+async def test_turn_on_raises_and_keeps_state_when_light_stays_off(ble):
+    client, *_ = ble
+    entity = _make_ble_light()
+    entity._ble_scheme = "plain"
+    captured = {}
+
+    async def start_notify(_uuid, callback):
+        captured["notify"] = callback
+
+    async def write(_uuid, data, _response):
+        if bytes(data)[:2] == bytes([0xAA, 0x01]):
+            captured["notify"](None, _status_frame(False))
+
+    client.start_notify = start_notify
+    client.write_gatt_char = write
+
+    with pytest.raises(ConnectionError, match="did not turn on"):
+        await entity.async_turn_on()
+
+    assert entity.is_on is None
+    entity._cancel_on_retry()
+    await entity._close_ble()
+
+
+async def test_turn_off_retries_when_light_reports_on_then_succeeds(ble):
+    client, *_ = ble
+    entity = _make_ble_light()
+    entity._ble_scheme = "plain"
+    replies = iter([_status_frame(True), _status_frame(False)])
+    captured = {}
+    writes = []
+
+    async def start_notify(_uuid, callback):
+        captured["notify"] = callback
+
+    async def write(_uuid, data, _response):
+        frame = bytes(data)
+        writes.append(frame)
+        if frame[:2] == bytes([0xAA, 0x01]):
+            captured["notify"](None, next(replies))
+
+    client.start_notify = start_notify
+    client.write_gatt_char = write
+
+    await entity.async_turn_off()
+
+    power_off = entity._build_ble_off_command()
+    assert writes.count(power_off) == 2
+    assert entity.is_on is False
+    await entity._close_ble()
+
+
+async def test_turn_on_verifies_encrypted_v1_and_v2_status_replies(ble):
+    from custom_components.govee_ble_lights import govee_crypto as gc
+
+    # v1 encrypted verification
+    client, *_ = ble
+    key = bytes(range(16))
+    captured = {}
+    writes = []
+
+    async def start_notify_v1(_uuid, callback):
+        captured["notify"] = callback
+
+    async def write_v1(_uuid, data, _response):
+        raw = bytes(data)
+        writes.append(raw)
+        if len(writes) == 1:
+            captured["notify"](None, _legacy_light_reply(raw, key))
+        elif len(writes) >= 3:
+            plain = gc._ecb_rc4(key, raw, False)
+            if plain[:2] == bytes([0xAA, 0x01]):
+                captured["notify"](None, gc._ecb_rc4(key, _status_frame(True), True))
+
+    client.start_notify = start_notify_v1
+    client.write_gatt_char = write_v1
+    v1_entity = _make_ble_light()
+
+    await v1_entity.async_turn_on()
+    assert v1_entity.is_on is True and v1_entity._ble_supports_status is True
+    await v1_entity._close_ble()
+
+    # v2 AES-GCM encrypted verification
+    device_iv_key = bytes(range(10, 18))
+    sku, mac_wire = b"H3501", bytes(range(6))
+    device_key = gc.derive_device_key(sku, mac_wire)
+    client.read_gatt_char = AsyncMock(return_value=bytes.fromhex("0102") + bytes(18))
+    v2_writes = []
+    dev_counter = 0
+
+    async def start_notify_v2(_uuid, callback):
+        captured["notify"] = callback
+
+    async def write_v2(_uuid, data, _response):
+        nonlocal dev_counter
+        raw = bytes(data)
+        v2_writes.append(raw)
+        if len(v2_writes) == 1:
+            iv = bytes(range(12))
+            header = bytes([0xE7, 0x11, 0x00]) + iv
+            payload = device_iv_key + sku + mac_wire
+            captured["notify"](None, header + gc._gcm_encrypt(gc.KEY_HANDSHAKE, iv, payload, header))
+        elif len(v2_writes) == 3:  # sealed aa 01 query
+            dev_counter += 1
+            ctr = dev_counter.to_bytes(4, "big")
+            reply = ctr + gc._gcm_encrypt(device_key, device_iv_key + ctr, _status_frame(True), ctr)
+            captured["notify"](None, reply)
+
+    client.start_notify = start_notify_v2
+    client.write_gatt_char = write_v2
+    v2_entity = _make_ble_light()
+
+    await v2_entity.async_turn_on()
+    assert v2_entity.is_on is True and v2_entity._ble_supports_status is True
+    await v2_entity._close_ble()
+
+
+async def test_silently_dead_kept_link_is_detected_by_missing_status_reply(ble):
+    client, establish, _ = ble
+    entity = _make_ble_light()
+    entity._ble_scheme = "plain"
+    captured = {}
+    silence_next = False
+
+    async def start_notify(_uuid, callback):
+        captured["notify"] = callback
+
+    async def write(_uuid, data, _response):
+        nonlocal silence_next
+        if bytes(data)[:2] == bytes([0xAA, 0x01]):
+            if silence_next:
+                silence_next = False
+                return  # simulates a half-dead kept link dropping writes silently
+            captured["notify"](None, _status_frame(True))
+
+    client.start_notify = start_notify
+    client.write_gatt_char = write
+
+    await entity.async_turn_on()  # learns _ble_supports_status = True
+    assert establish.await_count == 1
+
+    silence_next = True
+    await entity.async_turn_on()  # reused link goes silent -> reconnects fresh and succeeds
+    assert establish.await_count == 2
+    assert entity.is_on is True
+    await entity._close_ble()
+
+
+async def test_turn_on_that_cannot_connect_raises_and_retries_once_later(ble, monkeypatch):
+    client, establish, _ = ble
+    monkeypatch.setattr(light, "BLE_ON_RETRY_DELAY", 0.01)
+    establish.side_effect = [OSError("no link"), client]
+    entity = _make_ble_light()
+
+    with pytest.raises(ConnectionError):
+        await entity.async_turn_on(brightness=128)
+    assert entity.is_on is None
+
+    await asyncio.sleep(0.1)
+    assert entity.is_on is True
+    assert entity.brightness == 128
+    assert establish.await_count == 2
+    await entity._close_ble()
+
+
+async def test_turn_off_cancels_a_pending_on_retry(ble, monkeypatch):
+    client, establish, _ = ble
+    monkeypatch.setattr(light, "BLE_ON_RETRY_DELAY", 0.05)
+    establish.side_effect = [OSError("no link"), client]
+    entity = _make_ble_light()
+
+    with pytest.raises(ConnectionError):
+        await entity.async_turn_on()
+
+    await entity.async_turn_off()
+    await asyncio.sleep(0.15)
+
+    assert entity.is_on is False
+    assert establish.await_count == 2
+    await entity._close_ble()
+
+
+async def test_disconnected_callback_clears_cached_link_immediately(ble):
+    client, establish, _ = ble
+    entity = _make_ble_light()
+    entity._ble_scheme = "plain"
+
+    await entity.async_turn_on()
+    assert entity._ble_client is client
+    assert entity._ble_idle_handle is not None
+
+    callback = establish.call_args.kwargs["disconnected_callback"]
+    callback(client)
+
+    assert entity._ble_client is None
+    assert entity._ble_idle_handle is None
+    assert entity._ble_notify_started is False
+
+
+async def test_connecting_light_preempts_sibling_idle_link(ble):
+    client1 = MagicMock(is_connected=True, write_gatt_char=AsyncMock(), disconnect=AsyncMock(),
+                        read_gatt_char=AsyncMock(side_effect=BleakCharacteristicNotFoundError("2b12")),
+                        start_notify=AsyncMock())
+    client2 = MagicMock(is_connected=True, write_gatt_char=AsyncMock(), disconnect=AsyncMock(),
+                        read_gatt_char=AsyncMock(side_effect=BleakCharacteristicNotFoundError("2b12")),
+                        start_notify=AsyncMock())
+    _, establish, _ = ble
+    establish.side_effect = [client1, client2]
+
+    shared_hass = MagicMock(data={})
+    e1 = _make_ble_light()
+    e1._mac = "AA:BB:CC:DD:EE:01"
+    e1._ble_scheme = "plain"
+    e1.hass = shared_hass
+    e1._ble_light_registry().add(e1)
+
+    e2 = _make_ble_light()
+    e2._mac = "AA:BB:CC:DD:EE:02"
+    e2._ble_scheme = "plain"
+    e2.hass = shared_hass
+    e2._ble_light_registry().add(e2)
+
+    await e1.async_turn_on()
+    assert e1._ble_client is client1
+    client1.disconnect.assert_not_awaited()
+
+    await e2.async_turn_on()
+    client1.disconnect.assert_awaited_once()  # preempted before e2 connected
+    assert e1._ble_client is None
+    assert e2._ble_client is client2
+    await e2._close_ble()
+
+
+async def test_rapid_turn_on_burst_coalesces_to_latest_state(ble):
+    client, *_ = ble
+    entity = _make_ble_light()
+    entity._ble_scheme = "plain"
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    writes = []
+
+    async def write(_uuid, data, _response):
+        writes.append(bytes(data))
+        if len(writes) == 1:
+            first_write_started.set()
+            await release_first_write.wait()
+
+    client.write_gatt_char = write
+
+    first = asyncio.create_task(entity.async_turn_on(brightness=25))
+    await first_write_started.wait()
+
+    # Fire a burst while the first write holds _ble_lock.
+    burst = [
+        asyncio.create_task(entity.async_turn_on(brightness=75)),
+        asyncio.create_task(entity.async_turn_on(brightness=150, **{ATTR_RGB_COLOR: (10, 20, 30)})),
+        asyncio.create_task(entity.async_turn_on(brightness=255)),
+    ]
+    await asyncio.sleep(0)
+    release_first_write.set()
+    await asyncio.gather(first, *burst)
+
+    # Only two brightness frames should have gone over BLE: the first (10%) and the merged final (100%).
+    brightness_frames = [f for f in writes if f[:2] == bytes([0x33, 0x04])]
+    assert [f[2] for f in brightness_frames] == [10, 100]
+    color_frames = [f for f in writes if f[:2] == bytes([0x33, 0x05])]
+    assert len(color_frames) == 1 and list(color_frames[0][3:6]) == [10, 20, 30]
+    assert entity.brightness == 255
+    await entity._close_ble()
+
+
+async def test_h6095_scene_activation_proceeds_immediately_on_a3_ack(ble, monkeypatch):
+    client, *_ = ble
+    monkeypatch.setattr(light, "BLE_SCENE_ACTIVATE_DELAY", 5.0)  # would time out/crawl if we slept blindly
+    entity = _make_ble_light()
+    entity._model = "H6095"
+    entity._ble_scheme = "plain"
+    captured = {}
+
+    async def start_notify(_uuid, callback):
+        captured["notify"] = callback
+
+    async def write(_uuid, data, _response):
+        frame = bytes(data)
+        if frame[0] == 0xA3 and frame[1] == 0xFF and "notify" in captured:
+            ack = bytes([0xA3, 0x00]).ljust(19, b"\0")
+            checksum = 0
+            for b in ack:
+                checksum ^= b
+            captured["notify"](None, ack + bytes([checksum]))
+
+    client.start_notify = start_notify
+    client.write_gatt_char = write
+
+    # Pre-open notify (as happens on real v1/v2 or reused links) and trigger an H6095 scene.
+    await entity.async_turn_on()
+    start = asyncio.get_running_loop().time()
+    await entity.async_turn_on(**{ATTR_EFFECT: "Aurora"})
+    elapsed = asyncio.get_running_loop().time() - start
+
+    assert elapsed < 1.0  # returned immediately on the 0xA3 ack rather than waiting 5s
+    await entity._close_ble()

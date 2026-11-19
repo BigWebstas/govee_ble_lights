@@ -4,9 +4,11 @@ import array
 import asyncio
 import logging
 from functools import lru_cache
+from typing import NamedTuple
 
 from enum import IntEnum
 import bleak_retry_connector
+from bleak_retry_connector import BleakClientWithServiceCache
 
 from bleak import BleakClient
 from bleak.exc import BleakCharacteristicNotFoundError
@@ -41,6 +43,19 @@ UUID_ENCRYPTION_VERSION = '00010203-0405-0607-0809-0a0b0c0d2b12'
 # (and one key exchange). Writes are unacknowledged, so this also lets the last packets leave.
 BLE_IDLE_HOLD = 10
 BLE_OFF_RETRY_DELAY = 30  # seconds before the one retry of a turn-off that could not connect
+BLE_ON_RETRY_DELAY = 10  # seconds before the one retry of a turn-on that failed (cancelled by turn-off)
+# Seconds after sending a power command before querying `aa 01` to confirm the light acted on it.
+BLE_VERIFY_DELAY = 0.25
+# Seconds to wait for the `aa 01` power-status reply.
+BLE_VERIFY_TIMEOUT = 1.0
+# Total attempts (initial send + resends) when the light reports the wrong power state.
+BLE_POWER_VERIFY_ATTEMPTS = 2
+# Brief pause after v1 key confirmation so the light activates its session key before the first command.
+BLE_V1_CONFIRM_DELAY = 0.05
+# Cap on buffered unsolicited BLE notifications per connection.
+BLE_NOTIFY_QUEUE_MAX = 64
+# Key in hass.data[DOMAIN] tracking active BLE light entities so idle links can be preempted.
+BLE_LIGHTS_KEY = "_ble_lights"
 # Seconds segment writes are collected before being sent, so segments set together share frames.
 BLE_SEGMENT_BATCH_WINDOW = 0.1
 # Seconds to wait for the reply to a key exchange with a light already known to be encrypted...
@@ -87,6 +102,12 @@ class LedMode(IntEnum):
     MICROPHONE = 0x06
     SCENES = 0x05
     SEGMENTS = 0x15
+
+
+class _AckWait(NamedTuple):
+    """Wait on the notify channel for a decoded frame starting with `prefix`, capped at `timeout` s."""
+    prefix: int
+    timeout: float
 
 
 def _find_capability(capabilities: list, cap_type: str, instance: str) -> dict | None:
@@ -172,7 +193,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                     entities += [GoveeAPISegmentLight(hub, device, index) for index in range(count)]
                 async_add_entities(entities)
     elif hub.address is not None:
-        ble_device = bluetooth.async_ble_device_from_address(hass, hub.address.upper(), False)
+        ble_device = bluetooth.async_ble_device_from_address(hass, hub.address.upper(), True)
         # Parse the scene catalog in the executor: the entity reads it on every state write.
         await hass.async_add_executor_job(_read_catalog, config_entry.data["model"])
         ble_light = GoveeBluetoothLight(hub, ble_device, config_entry)
@@ -610,7 +631,7 @@ class GoveeBLEControlMixin:
                 commands.extend(self._build_scene_packets(base64.b64decode(scene_param)))
                 if self._model in ACTIVATED_SCENE_MODELS:
                     scene_code = self._resolve_effect_code(categoryIndex, sceneIndex, lightEffectIndex)
-                    commands.append(BLE_SCENE_ACTIVATE_DELAY)  # let the light ack the upload first
+                    commands.append(_AckWait(0xA3, BLE_SCENE_ACTIVATE_DELAY))  # wait for the upload ack (or timeout)
                     commands.append(self._build_scene_activate_command(scene_code))
 
         return commands
@@ -678,45 +699,110 @@ class GoveeBLEControlMixin:
     def _build_ble_off_command(self) -> bytes:
         return self._prepareSinglePacketData(LedCommand.POWER, [0x0])
 
-    async def _write_ble_commands(self, commands: list[bytes]) -> None:
+    async def _write_ble_commands(self, commands: list, *, verify_power: bool | None = None) -> None:
         """Write every command, connecting first if no link is open; the link then stays open.
 
         A light accepts one connection at a time and adapters/proxies have few slots, so the link
         is closed BLE_IDLE_HOLD seconds after the last write rather than held for the entity's
-        lifetime. If a write on a link kept from an earlier call fails (the light may have dropped
-        it silently), it is retried once on a fresh connection.
+        lifetime (and released sooner if another Govee BLE light needs a slot). If a write on a
+        link kept from an earlier call fails (the light may have dropped it silently), it is
+        retried once on a fresh connection. When `verify_power` is set, the power state is read
+        back via `aa 01` and the commands are resent if the light reports the wrong state.
         """
         async with self._ble_lock:
-            self._cancel_idle_close()
-            reused = self._ble_client is not None and self._ble_client.is_connected
-            try:
-                try:
-                    await self._send_on_link(commands)
-                except Exception as err:
-                    if not reused:
-                        raise
-                    _LOGGER.debug("Kept link to %s failed (%s), retrying on a new connection", self.unique_id, err)
-                    await self._drop_link()
-                    await self._send_on_link(commands)
-            except Exception:
-                if self._ble_scheme == BLE_SCHEME_PLAIN:  # the "plain" guess may be wrong: detect again next time
-                    self._ble_probe_misses = 0
-                    self._set_ble_scheme(None)
-                raise
-            self._arm_idle_close()
+            await self._write_ble_commands_locked(commands, verify_power=verify_power)
 
-    async def _send_on_link(self, commands: list[bytes]) -> None:
+    async def _write_ble_commands_locked(self, commands: list, *, verify_power: bool | None = None) -> None:
+        self._cancel_idle_close()
+        reused = self._ble_client is not None and self._ble_client.is_connected
+        try:
+            try:
+                await self._send_on_link(commands)
+            except Exception as err:
+                if not reused:
+                    raise
+                _LOGGER.debug("Kept link to %s failed (%s), retrying on a new connection", self.unique_id, err)
+                await self._drop_link()
+                reused = False
+                await self._send_on_link(commands)
+
+            if verify_power is not None:
+                await self._verify_and_retry_power(commands, verify_power, reused=reused)
+        except Exception:
+            if self._ble_scheme == BLE_SCHEME_PLAIN:  # the "plain" guess may be wrong: detect again next time
+                self._ble_probe_misses = 0
+                self._set_ble_scheme(None)
+            raise
+        self._arm_idle_close()
+
+    async def _verify_and_retry_power(self, commands: list, expected_on: bool, *, reused: bool) -> None:
+        """Confirm via `aa 01` that the light reached `expected_on`; resend once if it did not."""
+        action = "on" if expected_on else "off"
+        for attempt in range(BLE_POWER_VERIFY_ATTEMPTS):
+            if BLE_VERIFY_DELAY > 0:
+                await asyncio.sleep(BLE_VERIFY_DELAY)
+            try:
+                actual = await self._read_power()
+            except Exception as err:
+                if not reused:
+                    await self._drop_link()
+                    raise
+                _LOGGER.debug(
+                    "Status check on kept link to %s failed (%s), reconnecting and retrying turn_%s",
+                    self.unique_id, err, action,
+                )
+                await self._drop_link()
+                reused = False
+                await self._send_on_link(commands)
+                continue
+
+            if actual is expected_on:
+                return
+
+            if actual is None:
+                if not self._ble_supports_status:
+                    _LOGGER.debug("No power status reply from %s; accepting optimistically", self.unique_id)
+                    return
+                if attempt + 1 >= BLE_POWER_VERIFY_ATTEMPTS:
+                    await self._drop_link()
+                    raise ConnectionError(f"{self.unique_id} did not confirm turning {action}")
+                _LOGGER.debug(
+                    "No power status reply from %s on %s link; reconnecting and retrying turn_%s",
+                    self.unique_id, "kept" if reused else "fresh", action,
+                )
+                await self._drop_link()
+                reused = False
+                await self._send_on_link(commands)
+                continue
+
+            # Light explicitly reported the opposite power state.
+            if attempt + 1 >= BLE_POWER_VERIFY_ATTEMPTS:
+                raise ConnectionError(f"{self.unique_id} did not turn {action}")
+            _LOGGER.warning("%s still %s after turn_%s, retrying", self.unique_id, "on" if actual else "off", action)
+            if reused:
+                await self._drop_link()
+                reused = False
+            await self._send_on_link(commands)
+
+    async def _send_on_link(self, commands: list) -> None:
         if self._ble_client is None or not self._ble_client.is_connected:
             await self._drop_link()
+            await self._release_other_idle_links()
             client = await self._connectBluetooth()
             try:
                 self._ble_session = await self._open_encrypted_session(client)
             except BaseException:
+                self._ble_replies = None
+                self._ble_notify_started = False
                 await client.disconnect()
                 raise
             self._ble_client = client
+        self._drain_replies()
         try:
             for command in commands:
+                if isinstance(command, _AckWait):
+                    await self._wait_for_ack(command.prefix, command.timeout)
+                    continue
                 if isinstance(command, float):  # a pause between frames, not a frame
                     await asyncio.sleep(command)
                     continue
@@ -727,9 +813,132 @@ class GoveeBLEControlMixin:
             await self._drop_link()
             raise
 
+    async def _ensure_notify(self, client: BleakClient, *, required: bool = True) -> bool:
+        """Subscribe once per connection to `2b10` using a bounded queue (no listener leak)."""
+        if self._ble_notify_started and self._ble_replies is not None:
+            return True
+        replies: asyncio.Queue[bytes] = asyncio.Queue(maxsize=BLE_NOTIFY_QUEUE_MAX)
+
+        def _on_notify(_sender, data) -> None:
+            if replies.full():
+                try:
+                    replies.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            replies.put_nowait(bytes(data))
+
+        try:
+            await client.start_notify(UUID_NOTIFY_CHARACTERISTIC, _on_notify)
+        except BleakCharacteristicNotFoundError:
+            if required:
+                raise
+            return False
+        self._ble_replies = replies
+        self._ble_notify_started = True
+        return True
+
+    def _drain_replies(self) -> None:
+        if self._ble_replies is None:
+            return
+        while True:
+            try:
+                self._ble_replies.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    def _decode_notification(self, raw: bytes) -> bytes | None:
+        """Decrypt (when encrypted) and validate a 20-byte notification frame; None if foreign/corrupt."""
+        if self._ble_session is not None:
+            try:
+                return self._ble_session.open(raw)
+            except GoveeCryptoError as err:
+                _LOGGER.debug("Ignoring undecryptable notification from %s: %s", self.unique_id, err)
+                return None
+        if len(raw) != 20:
+            return None
+        checksum = 0
+        for b in raw[:19]:
+            checksum ^= b
+        if checksum != raw[19]:
+            return None
+        return raw
+
+    async def _wait_for_ack(self, prefix: int, timeout: float) -> None:
+        """Wait for a decoded notification starting with `prefix`, falling back to `timeout` s."""
+        replies = self._ble_replies
+        if replies is None:
+            await asyncio.sleep(timeout)
+            return
+        try:
+            async with asyncio.timeout(timeout):
+                while self._ble_client is not None:
+                    plain = self._decode_notification(await replies.get())
+                    if plain is not None and plain[0] == prefix:
+                        return
+        except TimeoutError:
+            return
+
+    async def _read_power(self) -> bool | None:
+        """Query power state with `aa 01`; returns True/False, or None if the light does not answer."""
+        if self._ble_client is None or not self._ble_client.is_connected:
+            return None
+        if not await self._ensure_notify(self._ble_client, required=False) or self._ble_replies is None:
+            return None
+        replies = self._ble_replies
+        self._drain_replies()
+        query = self._prepareQueryPacketData(LedCommand.POWER)
+        await self._ble_client.write_gatt_char(
+            UUID_CONTROL_CHARACTERISTIC,
+            self._ble_session.seal(query) if self._ble_session else query,
+            False,
+        )
+        try:
+            async with asyncio.timeout(BLE_VERIFY_TIMEOUT):
+                while self._ble_client is not None:
+                    plain = self._decode_notification(await replies.get())
+                    if plain is not None and plain[0] == 0xAA and plain[1] == LedCommand.POWER and plain[2] in (0x00, 0x01):
+                        self._ble_supports_status = True
+                        return plain[2] == 0x01
+        except TimeoutError:
+            return None
+        return None
+
+    def _on_ble_disconnected(self, client: BleakClient) -> None:
+        """Clear cached link state immediately when the light or proxy drops the connection."""
+        if client is not self._ble_client:
+            return
+        self._cancel_idle_close()
+        self._ble_client = None
+        self._ble_session = None
+        self._ble_replies = None
+        self._ble_notify_started = False
+
+    def _ble_light_registry(self) -> set | None:
+        data = getattr(getattr(self, "hass", None), "data", None)
+        if not isinstance(data, dict):
+            return None
+        return data.setdefault(DOMAIN, {}).setdefault(BLE_LIGHTS_KEY, set())
+
+    async def _release_other_idle_links(self) -> None:
+        """Close idle links held by sibling Govee BLE lights so proxy connection slots free up."""
+        registry = self._ble_light_registry()
+        if not registry:
+            return
+        idle_others = [
+            other for other in list(registry)
+            if other is not self and other._ble_idle_handle is not None and not other._ble_lock.locked()
+        ]
+        if not idle_others:
+            return
+        for other in idle_others:
+            other._cancel_idle_close()
+        await asyncio.gather(*(other._close_idle_link() for other in idle_others), return_exceptions=True)
+
     async def _drop_link(self) -> None:
         """Forget and hang up the open link, if any. Call with the lock held."""
         client, self._ble_client, self._ble_session = self._ble_client, None, None
+        self._ble_replies = None
+        self._ble_notify_started = False
         if client is not None:
             try:
                 await client.disconnect()
@@ -785,8 +994,10 @@ class GoveeBLEControlMixin:
         probing = self._ble_scheme is None
         session = EncryptedSession() if self._ble_scheme == BLE_SCHEME_V2 else LegacyEncryptedSession()
 
-        replies: asyncio.Queue[bytes] = asyncio.Queue()
-        await client.start_notify(UUID_NOTIFY_CHARACTERISTIC, lambda _, data: replies.put_nowait(bytes(data)))
+        await self._ensure_notify(client, required=True)
+        replies = self._ble_replies
+        assert replies is not None
+        self._drain_replies()
         await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, session.handshake_request(), False)
         try:
             async with asyncio.timeout(BLE_PROBE_TIMEOUT if probing else BLE_HANDSHAKE_TIMEOUT):
@@ -809,9 +1020,15 @@ class GoveeBLEControlMixin:
         if isinstance(session, LegacyEncryptedSession):
             self._set_ble_scheme(BLE_SCHEME_V1)
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, session.confirm_request(), False)
+            if BLE_V1_CONFIRM_DELAY > 0:
+                await asyncio.sleep(BLE_V1_CONFIRM_DELAY)
         return session
 
     async def _reports_encryption_v2(self, client: BleakClient) -> bool:
+        services = getattr(client, "services", None)
+        if services is not None and callable(getattr(services, "get_characteristic", None)):
+            if services.get_characteristic(UUID_ENCRYPTION_VERSION) is None:
+                return False
         try:
             marker = await client.read_gatt_char(UUID_ENCRYPTION_VERSION)
         except BleakCharacteristicNotFoundError:  # no marker: not a version 2 light
@@ -825,15 +1042,27 @@ class GoveeBLEControlMixin:
         if ble_device is None:
             raise ConnectionError(f"No Bluetooth device found for {self.unique_id}")
         try:
-            # establish_connection already retries internally; no extra loop on top of it.
-            return await bleak_retry_connector.establish_connection(BleakClient, ble_device, self.unique_id)
+            # establish_connection already retries internally; BleakClientWithServiceCache skips
+            # GATT service discovery on reconnects.
+            return await bleak_retry_connector.establish_connection(
+                BleakClientWithServiceCache,
+                ble_device,
+                self.unique_id,
+                disconnected_callback=self._on_ble_disconnected,
+            )
         except Exception as err:
             raise ConnectionError(f"Could not connect to {self.unique_id}") from err
 
+    def _prepareQueryPacketData(self, cmd: int, payload: bytes | list[int] = ()) -> bytes:
+        return self._preparePacketData(0xAA, cmd, payload)
+
     def _prepareSinglePacketData(self, cmd, payload):
+        return self._preparePacketData(0x33, cmd, payload)
+
+    def _preparePacketData(self, header: int, cmd, payload):
         if not isinstance(cmd, int):
             raise ValueError('Invalid command')
-        if not isinstance(payload, bytes) and not (
+        if not isinstance(payload, (bytes, tuple)) and not (
                 isinstance(payload, list) and all(isinstance(x, int) for x in payload)):
             raise ValueError('Invalid payload')
         if len(payload) > 17:
@@ -842,7 +1071,7 @@ class GoveeBLEControlMixin:
         cmd = cmd & 0xFF
         payload = bytes(payload)
 
-        frame = bytes([0x33, cmd]) + bytes(payload)
+        frame = bytes([header & 0xFF, cmd]) + payload
         # pad frame data to 19 bytes (plus checksum)
         frame += bytes([0] * (19 - len(frame)))
 
@@ -872,10 +1101,17 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
         self._ble_probe_misses = 0
         self._ble_client: BleakClient | None = None
         self._ble_session = None
+        self._ble_replies: asyncio.Queue[bytes] | None = None
+        self._ble_notify_started = False
+        self._ble_supports_status: bool | None = None
         self._ble_idle_handle: asyncio.TimerHandle | None = None
         self._ble_close_task: asyncio.Task | None = None
         self._off_retry_handle: asyncio.TimerHandle | None = None
         self._off_retry_task: asyncio.Task | None = None
+        self._on_retry_handle: asyncio.TimerHandle | None = None
+        self._on_retry_task: asyncio.Task | None = None
+        self._pending_turn_on: dict | None = None
+        self._pending_turn_on_future: asyncio.Future | None = None
         self._segment_pending: dict[tuple, int] = {}
         self._segment_flush: asyncio.Future | None = None
         self._scheme_store: Store | None = None
@@ -884,13 +1120,21 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
+        registry = self._ble_light_registry()
+        if registry is not None:
+            registry.add(self)
         self._scheme_store = Store(self.hass, 1, f"{DOMAIN}/ble_scheme_{self.unique_id}.json")
         saved = await self._scheme_store.async_load()
         if saved and saved.get("scheme") in (BLE_SCHEME_V1, BLE_SCHEME_V2, BLE_SCHEME_PLAIN):
             self._ble_scheme = saved["scheme"]
 
     async def async_will_remove_from_hass(self) -> None:
+        registry = self._ble_light_registry()
+        if registry is not None:
+            registry.discard(self)
+        self._cancel_on_retry()
         self._cancel_off_retry()
+        self._cancel_pending_turn_on()
         await self._close_ble()  # never abandon an open link
         await super().async_will_remove_from_hass()
 
@@ -926,12 +1170,16 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
     def effect_list(self) -> list[str] | None:
         return self._local_ble_effect_list()
 
-    async def async_turn_on(self, **kwargs) -> None:
-        self._cancel_off_retry()  # a queued turn-off must not undo this
-        await self._write_ble_commands(self._build_ble_on_commands(**kwargs))
+    @staticmethod
+    def _merge_turn_on_kwargs(base: dict, incoming: dict) -> dict:
+        merged = {**base, **incoming}
+        if ATTR_EFFECT in incoming:
+            merged.pop(ATTR_RGB_COLOR, None)
+        elif ATTR_RGB_COLOR in incoming:
+            merged.pop(ATTR_EFFECT, None)
+        return merged
 
-        # BLE has no state read-back, so state is tracked optimistically, but only once the
-        # write has gone out: a failed connect raises and leaves the shown state unchanged.
+    def _apply_turn_on_state(self, kwargs: dict) -> None:
         self._state = True
         if ATTR_BRIGHTNESS in kwargs:
             self._brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
@@ -941,10 +1189,86 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
             self._attr_effect = None
         self.async_write_ha_state()
 
-    async def async_turn_off(self, **kwargs) -> None:
-        self._cancel_off_retry()
+    async def _execute_turn_on_locked(self, kwargs: dict, *, allow_retry: bool = True) -> None:
         try:
-            await self._write_ble_commands([self._build_ble_off_command()])
+            await self._write_ble_commands_locked(self._build_ble_on_commands(**kwargs), verify_power=True)
+        except ConnectionError as err:
+            if allow_retry:
+                _LOGGER.warning("Could not turn on %s (%s), retrying in %s s", self.unique_id, err, BLE_ON_RETRY_DELAY)
+                self._on_retry_handle = asyncio.get_running_loop().call_later(
+                    BLE_ON_RETRY_DELAY, self._start_on_retry, dict(kwargs)
+                )
+            raise
+        self._apply_turn_on_state(kwargs)
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self._cancel_off_retry()  # a queued turn-off must not undo this
+        self._cancel_on_retry()
+
+        if self._ble_lock.locked():
+            # Coalesce rapid bursts (e.g. brightness/color slider drags) while a write is in flight.
+            if self._pending_turn_on is not None and self._pending_turn_on_future is not None:
+                self._pending_turn_on = self._merge_turn_on_kwargs(self._pending_turn_on, kwargs)
+                await asyncio.shield(self._pending_turn_on_future)
+                return
+
+            self._pending_turn_on = dict(kwargs)
+            future = asyncio.get_running_loop().create_future()
+            self._pending_turn_on_future = future
+            async with self._ble_lock:
+                merged = self._pending_turn_on
+                self._pending_turn_on = None
+                self._pending_turn_on_future = None
+                if merged is None:
+                    if not future.done():
+                        future.set_result(None)
+                    return
+                try:
+                    await self._execute_turn_on_locked(merged)
+                except BaseException as err:
+                    if not future.done():
+                        future.set_exception(err)
+                        future.exception()
+                    raise
+                if not future.done():
+                    future.set_result(None)
+            return
+
+        async with self._ble_lock:
+            await self._execute_turn_on_locked(kwargs)
+
+    def _start_on_retry(self, kwargs: dict) -> None:
+        self._on_retry_handle = None
+        self._on_retry_task = asyncio.create_task(self._retry_on(kwargs))
+
+    async def _retry_on(self, kwargs: dict) -> None:
+        try:
+            async with self._ble_lock:
+                await self._execute_turn_on_locked(kwargs, allow_retry=False)
+        except ConnectionError as err:
+            _LOGGER.warning("Gave up turning on %s: %s", self.unique_id, err)
+
+    def _cancel_on_retry(self) -> None:
+        if self._on_retry_handle is not None:
+            self._on_retry_handle.cancel()
+            self._on_retry_handle = None
+        if self._on_retry_task is not None:
+            self._on_retry_task.cancel()
+            self._on_retry_task = None
+
+    def _cancel_pending_turn_on(self) -> None:
+        self._pending_turn_on = None
+        if self._pending_turn_on_future is not None:
+            if not self._pending_turn_on_future.done():
+                self._pending_turn_on_future.set_result(None)
+            self._pending_turn_on_future = None
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self._cancel_on_retry()
+        self._cancel_off_retry()
+        self._cancel_pending_turn_on()
+        try:
+            await self._write_ble_commands([self._build_ble_off_command()], verify_power=False)
         except ConnectionError as err:
             # Turning off is routine and idempotent, so an unreachable light gets one later retry
             # instead of failing every script that switches off a group containing it.
@@ -960,7 +1284,7 @@ class GoveeBluetoothLight(LightEntity, GoveeBLEControlMixin):
 
     async def _retry_off(self) -> None:
         try:
-            await self._write_ble_commands([self._build_ble_off_command()])
+            await self._write_ble_commands([self._build_ble_off_command()], verify_power=False)
         except ConnectionError as err:
             _LOGGER.warning("Gave up turning off %s: %s", self.unique_id, err)
             return

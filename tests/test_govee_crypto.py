@@ -76,6 +76,25 @@ def test_seal_requires_handshake():
         gc.EncryptedSession().seal(b"\0" * 20)
 
 
+def test_v2_open_decrypts_device_notification_and_rejects_bad_frames():
+    session, _ = _open_session()
+    device_key = gc.derive_device_key(SKU, MAC_WIRE)
+    plain = bytes.fromhex("aa010100000000000000000000000000000000aa")
+    counter = (1).to_bytes(4, "big")
+    sealed = counter + gc._gcm_encrypt(device_key, DEVICE_IV_KEY + counter, plain, counter)
+
+    assert session.open(sealed) == plain
+
+    tampered = bytearray(sealed)
+    tampered[-1] ^= 1
+    with pytest.raises(gc.GoveeCryptoError):
+        session.open(bytes(tampered))
+    with pytest.raises(gc.GoveeCryptoError):
+        session.open(b"\0" * 10)
+    with pytest.raises(gc.GoveeCryptoError):
+        gc.EncryptedSession().open(sealed)
+
+
 @pytest.mark.parametrize("marker,version", [(None, 0), (b"", 0), (bytes.fromhex("0102") + bytes(18), 2),
                                             (bytes.fromhex("0101"), 1), (bytes.fromhex("0900"), 0)])
 def test_parse_encryption_version(marker, version):
@@ -118,3 +137,22 @@ def test_legacy_rejects_bad_checksum_and_foreign_frames():
         session.accept_handshake_response(b"\xaa\x01" + bytes(18))
     with pytest.raises(gc.GoveeCryptoError):
         session.seal(bytes(20))
+    with pytest.raises(gc.GoveeCryptoError):
+        session.open(bytes(20))
+
+
+def test_legacy_session_opens_valid_frames_and_rejects_bad_checksum():
+    session = gc.LegacyEncryptedSession()
+    key = bytes(range(16))
+    session.accept_handshake_response(_legacy_reply(key))
+    plain = bytes.fromhex("aa010100000000000000000000000000000000aa")
+    sealed = gc._ecb_rc4(key, plain, True)
+
+    assert session.open(sealed) == plain
+
+    bad_plain = bytearray(plain)
+    bad_plain[-1] ^= 1
+    with pytest.raises(gc.GoveeCryptoError, match="checksum"):
+        session.open(gc._ecb_rc4(key, bytes(bad_plain), True))
+    with pytest.raises(gc.GoveeCryptoError):
+        session.open(b"\0" * 10)

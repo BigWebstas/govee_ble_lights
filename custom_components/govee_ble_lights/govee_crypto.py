@@ -75,6 +75,7 @@ class EncryptedSession:
 
     def __init__(self) -> None:
         self._client_iv_key = os.urandom(8)
+        self._device_iv_key: bytes | None = None
         self._device_key: bytes | None = None
         self._counter = 1
 
@@ -98,6 +99,7 @@ class EncryptedSession:
         plain = _gcm_decrypt(KEY_HANDSHAKE, frame[3:15], frame[15:], frame[:15])
         if len(plain) != 19:
             raise GoveeCryptoError(f"unexpected handshake payload length {len(plain)}")
+        self._device_iv_key = plain[:8]
         self._device_key = derive_device_key(plain[8:13], plain[13:19])
 
     def seal(self, frame: bytes) -> bytes:
@@ -107,6 +109,16 @@ class EncryptedSession:
         counter = struct.pack(">I", self._counter)
         self._counter += 1
         return counter + _gcm_encrypt(self._device_key, self._client_iv_key + counter, bytes(frame), counter)
+
+    def open(self, frame: bytes) -> bytes:
+        """Open a device notification: `counter(4) + gcm(frame)`; nonce is device ivKey plus counter."""
+        if self._device_key is None or self._device_iv_key is None:
+            raise GoveeCryptoError("handshake not completed")
+        frame = bytes(frame)
+        if len(frame) < 4 + TAG_LEN:
+            raise GoveeCryptoError("frame too short")
+        counter = frame[:4]
+        return _gcm_decrypt(self._device_key, self._device_iv_key + counter, frame[4:], counter)
 
 
 # --- Version 1: AES-ECB + RC4, no marker characteristic ------------------------------------------
@@ -187,3 +199,14 @@ class LegacyEncryptedSession:
         if self._key is None:
             raise GoveeCryptoError("handshake not completed")
         return _ecb_rc4(self._key, bytes(frame), True)
+
+    def open(self, frame: bytes) -> bytes:
+        if self._key is None:
+            raise GoveeCryptoError("handshake not completed")
+        frame = bytes(frame)
+        if len(frame) != FRAME_LEN:
+            raise GoveeCryptoError(f"unexpected frame length {len(frame)}")
+        plain = _ecb_rc4(self._key, frame, False)
+        if _xor_checksum(plain[:19]) != plain[19]:
+            raise GoveeCryptoError("frame failed checksum")
+        return plain
