@@ -3,7 +3,7 @@ import base64
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from bleak.exc import BleakCharacteristicNotFoundError
+from bleak.exc import BleakCharacteristicNotFoundError, BleakError
 from homeassistant.components.light import ATTR_EFFECT, ATTR_RGB_COLOR
 
 from custom_components.govee_ble_lights import light
@@ -174,6 +174,11 @@ def ble(monkeypatch):
     monkeypatch.setattr(light, "BLE_VERIFY_DELAY", 0)
     monkeypatch.setattr(light, "BLE_VERIFY_TIMEOUT", 0.01)
     monkeypatch.setattr(light, "BLE_V1_CONFIRM_DELAY", 0)
+    monkeypatch.setattr(light.bluetooth, "async_register_callback", MagicMock())
+    monkeypatch.setattr(light.bluetooth, "async_track_unavailable", MagicMock())
+    monkeypatch.setattr(light, "async_call_later", MagicMock())
+    monkeypatch.setattr(light, "async_track_time_interval", MagicMock())
+    monkeypatch.setattr(light.GoveeBluetoothLight, "async_get_last_state", AsyncMock(return_value=None))
     yield client, establish, lookup
     for entity in _BLE_ENTITIES:
         entity._cancel_on_retry()
@@ -270,12 +275,12 @@ async def test_failed_write_on_fresh_link_is_not_retried(ble):
     client.write_gatt_char.side_effect = OSError("boom")
     entity = _make_ble_light()
 
-    with pytest.raises(OSError):
-        await entity.async_turn_off()
+    await entity.async_turn_off()
 
     assert establish.await_count == 1
     client.disconnect.assert_awaited_once()
     assert entity._ble_client is None
+    assert entity._off_retry_handle is not None
 
 
 async def test_connect_is_attempted_once(ble):
@@ -308,7 +313,7 @@ async def test_learned_scheme_is_saved_and_restored(ble, monkeypatch):
     assert entity._ble_scheme == "v1"
 
     entity._set_ble_scheme("plain")
-    assert store.async_delay_save.call_args.args[0]() == {"scheme": "plain"}
+    assert store.async_delay_save.call_args.args[0]()["scheme"] == "plain"
 
 
 async def test_garbage_in_the_store_is_ignored(ble, monkeypatch):
@@ -343,7 +348,7 @@ async def test_ble_falls_back_to_cached_device(ble):
     assert entity.is_on is True
 
 
-async def test_encrypted_light_gets_handshake_then_sealed_frames(ble):
+async def test_encrypted_light_gets_handshake_then_sealed_frames(ble, monkeypatch):
     from custom_components.govee_ble_lights import govee_crypto as gc
 
     client, *_ = ble
@@ -354,6 +359,7 @@ async def test_encrypted_light_gets_handshake_then_sealed_frames(ble):
         captured["notify"] = callback
 
     writes = []
+    monkeypatch.setattr(light.GoveeBluetoothLight, "_read_power", AsyncMock(return_value=False))
 
     async def write(_uuid, data, _response):
         writes.append(bytes(data))
@@ -371,8 +377,7 @@ async def test_encrypted_light_gets_handshake_then_sealed_frames(ble):
 
     plain = entity._build_ble_off_command()
     assert writes[0][:3] == bytes([0xE7, 0x11, 0x01])
-    assert len(writes) == 3 and writes[1] != plain and len(writes[1]) == 4 + 20 + gc.TAG_LEN
-    assert len(writes[2]) == 4 + 20 + gc.TAG_LEN  # sealed aa 01 power query
+    assert len(writes) == 2 and writes[1] != plain and len(writes[1]) == 4 + 20 + gc.TAG_LEN
     assert entity.is_on is False
 
 
@@ -388,7 +393,13 @@ async def test_encrypted_handshake_timeout_raises_and_keeps_state(ble, monkeypat
 
     assert entity.is_on is None
     client.disconnect.assert_awaited_once()
-    assert entity._ble_scheme is None  # a remembered scheme that stops answering is forgotten
+    assert entity._ble_scheme == "v2"  # one missed reply does not forget the scheme
+
+
+def _sealed_off_status(key: bytes) -> bytes:
+    from custom_components.govee_ble_lights import govee_crypto as gc
+
+    return gc._ecb_rc4(key, _status_frame(False), True)
 
 
 def _legacy_light_reply(request: bytes, key: bytes) -> bytes:
@@ -413,6 +424,8 @@ async def test_legacy_encrypted_light_is_detected_and_sealed(ble):
         writes.append(bytes(data))
         if len(writes) % 4 == 1:  # round 1 of each connection: the light answers with its session key
             captured["notify"](None, _legacy_light_reply(bytes(data), key))
+        elif len(writes) % 4 == 0:  # the aa 01 query
+            captured["notify"](None, gc._ecb_rc4(key, _status_frame(False), True))
 
     client.start_notify = start_notify
     client.write_gatt_char = write
@@ -484,8 +497,11 @@ async def test_positive_detection_resets_the_miss_counter(ble):
         captured["notify"] = callback
 
     async def write(_uuid, data, _response):
-        if len(client.sent) % 3 == 0:
-            captured["notify"](None, _legacy_light_reply(bytes(data), bytes(range(16))))
+        key = bytes(range(16))
+        if not client.sent:
+            captured["notify"](None, _legacy_light_reply(bytes(data), key))
+        elif len(client.sent) == 3:
+            captured["notify"](None, _sealed_off_status(key))
         client.sent.append(bytes(data))
 
     client.sent = []
@@ -502,8 +518,8 @@ async def test_flaky_marker_read_is_not_a_miss(ble):
     client.read_gatt_char = AsyncMock(side_effect=TimeoutError("flaky"))
     entity = _make_ble_light()
 
-    with pytest.raises(TimeoutError):
-        await entity.async_turn_off()
+    with pytest.raises(ConnectionError):
+        await entity.async_turn_on()
 
     assert entity._ble_probe_misses == 0 and entity._ble_scheme is None
     client.write_gatt_char.assert_not_awaited()
@@ -670,9 +686,9 @@ async def test_failed_segment_batch_raises_in_every_caller_and_keeps_state(ble):
     assert all(s.is_on is None for s in segments)
 
 
-async def test_turn_off_that_cannot_connect_is_retried_once_later(ble, monkeypatch):
+async def test_turn_off_that_cannot_connect_is_retried_later(ble, monkeypatch):
     client, establish, _ = ble
-    monkeypatch.setattr(light, "BLE_OFF_RETRY_DELAY", 0.01)
+    monkeypatch.setattr(light, "BLE_RETRY_DELAYS", (0.01, 0.01, 0.01))
     establish.side_effect = [OSError("no link"), client]
     entity = _make_ble_light()
 
@@ -687,20 +703,21 @@ async def test_turn_off_that_cannot_connect_is_retried_once_later(ble, monkeypat
 
 async def test_failed_off_retry_gives_up_quietly(ble, monkeypatch):
     _, establish, _ = ble
-    monkeypatch.setattr(light, "BLE_OFF_RETRY_DELAY", 0.01)
+    monkeypatch.setattr(light, "BLE_RETRY_DELAYS", (0.01, 0.01, 0.01))
     establish.side_effect = OSError("no link")
     entity = _make_ble_light()
 
     await entity.async_turn_off()
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.2)
 
-    assert establish.await_count == 2
+    assert establish.await_count == 4  # the command and three retries
     assert entity.is_on is None
+    assert entity.available is False
 
 
 async def test_turn_on_cancels_a_pending_off_retry(ble, monkeypatch):
     client, establish, _ = ble
-    monkeypatch.setattr(light, "BLE_OFF_RETRY_DELAY", 0.05)
+    monkeypatch.setattr(light, "BLE_RETRY_DELAYS", (0.05,))
     establish.side_effect = [OSError("no link"), client]
     entity = _make_ble_light()
 
@@ -919,7 +936,7 @@ async def test_silently_dead_kept_link_is_detected_by_missing_status_reply(ble):
 
 async def test_turn_on_that_cannot_connect_raises_and_retries_once_later(ble, monkeypatch):
     client, establish, _ = ble
-    monkeypatch.setattr(light, "BLE_ON_RETRY_DELAY", 0.01)
+    monkeypatch.setattr(light, "BLE_RETRY_DELAYS", (0.01, 0.01, 0.01))
     establish.side_effect = [OSError("no link"), client]
     entity = _make_ble_light()
 
@@ -936,7 +953,7 @@ async def test_turn_on_that_cannot_connect_raises_and_retries_once_later(ble, mo
 
 async def test_turn_off_cancels_a_pending_on_retry(ble, monkeypatch):
     client, establish, _ = ble
-    monkeypatch.setattr(light, "BLE_ON_RETRY_DELAY", 0.05)
+    monkeypatch.setattr(light, "BLE_RETRY_DELAYS", (0.05,))
     establish.side_effect = [OSError("no link"), client]
     entity = _make_ble_light()
 
@@ -1097,3 +1114,176 @@ def test_scene_upload_is_followed_by_activation(model, name):
     assert bytes(commands[1])[:5].hex() == "a300010" + str(len(commands) - 3) + "02"
     code = catalog._resolve_effect_code(*indexes[:3])
     assert commands[-1][:6] == bytes([0x33, 0x05, 0x04, *code.to_bytes(2, "little"), 0x00])
+
+
+async def test_transport_error_on_turn_on_is_retried(ble, monkeypatch):
+    client, *_ = ble
+    monkeypatch.setattr(light, "BLE_RETRY_DELAYS", (0.01,))
+    entity = _make_ble_light()
+    entity._ble_scheme = "plain"
+    client.write_gatt_char.side_effect = [BleakError("gatt"), None, None, None, None]
+
+    with pytest.raises(ConnectionError, match="gatt"):
+        await entity.async_turn_on()
+    await asyncio.sleep(0.1)
+
+    assert entity.is_on is True
+    await entity._close_ble()
+
+
+async def test_failure_arriving_after_a_newer_command_schedules_no_retry(ble):
+    _, establish, _ = ble
+    entity = _make_ble_light()
+    release = asyncio.Event()
+
+    async def slow_failure(*_args, **_kwargs):
+        await release.wait()
+        raise OSError("late")
+
+    establish.side_effect = slow_failure
+    on = asyncio.create_task(entity.async_turn_on())
+    await asyncio.sleep(0)
+    off = asyncio.create_task(entity.async_turn_off())
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(on, off, return_exceptions=True)
+
+    assert entity._on_retry_handle is None
+
+
+async def test_scheme_is_forgotten_after_repeated_handshake_failures_but_never_becomes_plain(ble, monkeypatch):
+    client, *_ = ble
+    monkeypatch.setattr(light, "BLE_HANDSHAKE_TIMEOUT", 0.01)
+    entity = _make_ble_light()
+    entity._set_ble_scheme("v1")
+
+    for _ in range(light.BLE_SCHEME_FORGET_AFTER):
+        assert entity._ble_scheme == "v1"
+        with pytest.raises(ConnectionError, match="handshake"):
+            await entity._write_ble_commands([entity._build_ble_off_command()])
+    assert entity._ble_scheme is None
+
+    client.write_gatt_char.reset_mock()
+    with pytest.raises(ConnectionError, match="handshake"):
+        await entity._write_ble_commands([entity._build_ble_off_command()])
+    assert client.write_gatt_char.await_count == 1  # only the key request, never a plain command
+
+
+async def test_silent_encrypted_light_is_not_reported_on(ble):
+    entity = _make_ble_light()
+    entity._ble_scheme = "v1"
+    entity._open_encrypted_session = AsyncMock(return_value=None)
+
+    with pytest.raises(ConnectionError, match="did not confirm"):
+        await entity.async_turn_on()
+
+    assert entity.is_on is None
+    entity._cancel_on_retry()
+
+
+async def test_connection_attempts_are_limited(ble):
+    client, establish, _ = ble
+    hass = MagicMock(data={})
+    active = peak = 0
+
+    async def connect(*_args, **_kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return client
+
+    establish.side_effect = connect
+    entities = [_make_ble_light() for _ in range(5)]
+    for entity in entities:
+        entity.hass, entity._ble_scheme = hass, "plain"
+
+    await asyncio.gather(*(e.async_turn_off() for e in entities))
+
+    assert peak == light.BLE_CONNECT_LIMIT
+    for entity in entities:
+        await entity._close_ble()
+
+
+def _answering(client, power: bool, level: int):
+    """Make the fake light answer `aa 01` and `aa 04`."""
+    captured = {}
+
+    async def start_notify(_uuid, callback):
+        captured["notify"] = callback
+
+    async def write(_uuid, data, _response):
+        if data[0] == 0xAA:
+            body = bytes([0xAA, data[1], int(power) if data[1] == 0x01 else level]).ljust(19, b"\0")
+            checksum = 0
+            for byte in body:
+                checksum ^= byte
+            captured["notify"](None, body + bytes([checksum]))
+
+    client.start_notify = start_notify
+    client.write_gatt_char = write
+
+
+async def test_poll_reads_state_and_releases_the_link(ble):
+    client, *_ = ble
+    _answering(client, True, 40)
+    entity = _make_ble_light()
+    entity._ble_scheme = "plain"
+
+    await entity._async_poll()
+
+    assert entity.is_on is True and entity.brightness == 102
+    assert "last_confirmed" in entity.extra_state_attributes
+    client.disconnect.assert_awaited_once()
+
+
+async def test_poll_is_skipped_while_a_retry_is_pending(ble):
+    _, establish, _ = ble
+    entity = _make_ble_light()
+    establish.side_effect = OSError("no link")
+    await entity.async_turn_off()
+
+    await entity._async_poll()
+
+    assert establish.await_count == 1
+
+
+async def test_unreachable_light_becomes_unavailable_and_recovers(ble):
+    client, establish, _ = ble
+    establish.side_effect = OSError("no link")
+    entity = _make_ble_light()
+    segment = _segments(entity, 1)[0]
+
+    for _ in range(light.BLE_UNAVAILABLE_AFTER):
+        await entity._async_poll()
+    assert entity.available is False and segment.available is False
+    assert "Could not connect" in entity.extra_state_attributes["last_error"]
+
+    establish.side_effect = None
+    _answering(client, False, 10)
+    await entity._async_poll()
+    assert entity.available is True and entity.is_on is False
+
+
+async def test_light_gone_from_bluetooth_is_unavailable_until_it_advertises(ble):
+    entity = _make_ble_light()
+
+    entity._on_gone(None)
+    assert entity.available is False
+
+    entity._on_advertisement(None, None)
+    assert entity.available is True
+    entity.hass.async_create_task.assert_called_once()
+    entity.hass.async_create_task.call_args.args[0].close()
+
+
+async def test_state_is_restored_after_a_restart(ble, monkeypatch):
+    monkeypatch.setattr(light.GoveeBluetoothLight, "async_get_last_state",
+                        AsyncMock(return_value=MagicMock(state="on", attributes={"brightness": 77})))
+    entity = _make_ble_light()
+
+    await entity._restore_state()
+
+    assert entity.is_on is True and entity.brightness == 77
+

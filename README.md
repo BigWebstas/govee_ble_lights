@@ -84,7 +84,15 @@ Lights with segments (H6053, H6072, H6102, H6199, H70B1, H6095, H7092, H619D) ge
 
 4. **Logs**: Home Assistant logs show errors from the integration under **Settings > System > Logs**.
 
-BLE lights have no state read-back, so their on/off state, brightness and active scene are tracked optimistically.
+5. **Light shows "Unavailable"**: Home Assistant has not heard it over Bluetooth for a while, or three operations in a row failed. Check its power and range, and close the Govee app (a light accepts one connection). It recovers on the next successful read.
+
+### Connection and state
+
+- Power and brightness are read back from each BLE light shortly after startup and every 5 minutes, so changes made elsewhere can take that long to appear. The active scene and colour are not read back.
+- The last known state is restored after a restart.
+- A failed turn-on or turn-off is retried after 5, 15 and 45 seconds. A newer command cancels the retries.
+- At most two lights connect at the same time.
+- The `last_confirmed` and `last_error` attributes show the last successful status read and the last failure.
 
 ---
 
