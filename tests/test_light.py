@@ -1081,3 +1081,19 @@ def test_all_available_ble_models_load_from_compressed_catalog():
     for model in _AVAILABLE_MODELS:
         catalog = light._read_catalog(model)
         assert catalog["data"]["categories"]
+
+
+@pytest.mark.parametrize(("model", "name"), [("H3501", "Rainbow"), ("H7093", "Aurora")])
+def test_scene_upload_is_followed_by_activation(model, name):
+    light_ = object.__new__(GoveeBLEControlMixin)
+    light_._model = model
+    light_._is_segmented = False
+    catalog = _Catalog(model)
+    light_._load_effects_json = catalog._load_effects_json
+    indexes = catalog._effect_map()[name]
+
+    commands = light_._build_ble_on_commands(effect=name)
+
+    assert bytes(commands[1])[:5].hex() == "a300010" + str(len(commands) - 3) + "02"
+    code = catalog._resolve_effect_code(*indexes[:3])
+    assert commands[-1][:6] == bytes([0x33, 0x05, 0x04, *code.to_bytes(2, "little"), 0x00])

@@ -74,9 +74,11 @@ BLE_SCHEME_SAVE_DELAY = 1
 # [0x02] + payload (confirmed for H70B1 from a Govee Home app capture).
 PICTURE_SCENE_MODELS = ['H70B1']
 # Models that upload a scene as plain `a3` packets (no 02 header) with the payload's first byte
-# raised by this offset, then switch to it with `33 05 04 <sceneCode lo> <hi> <extra>`
-# (confirmed for H6095 from a Govee Home app capture, 2026-11-17).
-ACTIVATED_SCENE_MODELS: dict[str, int] = {'H6095': 8}
+# raised by this offset (confirmed for H6095 from a Govee Home app capture, 2026-11-17).
+RAISED_TYPE_SCENE_MODELS: dict[str, int] = {'H6095': 8}
+# Models that only switch to an uploaded scene after `33 05 04 <sceneCode lo> <hi> <extra>`.
+# H3501 and H7093 keep the generic `02` header; their activation is not yet capture-verified.
+ACTIVATED_SCENE_MODELS = ['H6095', 'H3501', 'H7093']
 # Seconds to let a light ack a scene upload before the activation frame follows (the app waits
 # for the ack, which arrives within ~0.2 s).
 BLE_SCENE_ACTIVATE_DELAY = 0.25
@@ -664,8 +666,8 @@ class GoveeBLEControlMixin:
 
     def _build_scene_packets(self, scene: bytes) -> list:
         """Split a catalog scene payload into the chunked 0xa3 packets the light expects."""
-        if self._model in ACTIVATED_SCENE_MODELS:
-            header, scene = [], bytes([(scene[0] + ACTIVATED_SCENE_MODELS[self._model]) & 0xFF]) + scene[1:]
+        if self._model in RAISED_TYPE_SCENE_MODELS:
+            header, scene = [], bytes([(scene[0] + RAISED_TYPE_SCENE_MODELS[self._model]) & 0xFF]) + scene[1:]
         elif self._model in PICTURE_SCENE_MODELS:
             header, scene = [], bytes([0x0c, scene[0] + 0x3b]) + scene[1:]
         else:
