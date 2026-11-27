@@ -77,7 +77,7 @@ PICTURE_SCENE_MODELS = ['H70B1']
 # raised by this offset (confirmed for H6095 from a Govee Home app capture, 2026-11-17).
 RAISED_TYPE_SCENE_MODELS: dict[str, int] = {'H6095': 8}
 # Models that only switch to an uploaded scene after `33 05 04 <sceneCode lo> <hi> <extra>`.
-# H3501 and H7093 keep the generic `02` header; their activation is not yet capture-verified.
+# H3501 and H7093 keep the generic `02` header (confirmed on hardware).
 ACTIVATED_SCENE_MODELS = ['H6095', 'H3501', 'H7093']
 # Seconds to let a light ack a scene upload before the activation frame follows (the app waits
 # for the ack, which arrives within ~0.2 s).
